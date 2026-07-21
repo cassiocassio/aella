@@ -116,14 +116,14 @@ cur_ip() {
 }
 
 build_userdata() {  # emit a first-boot cloud-init shell script to stdout
-  # Embed this Mac's ghostty terminfo (base64, so arbitrary bytes survive intact)
-  # so nano/less/tput + the coloured prompt work natively on the box. Degrades
-  # gracefully: if infocmp yields nothing, the .bashrc guard below falls the box
-  # back to xterm-256color instead.
+  # Embed the local terminal's ghostty terminfo, if any (base64, so arbitrary bytes
+  # survive intact) so nano/less/tput + the coloured prompt work natively on the box.
+  # Degrades gracefully: if infocmp yields nothing (not Ghostty, or no infocmp), the
+  # .bashrc guard below falls the box back to xterm-256color instead.
   local ti; ti=$(infocmp -x xterm-ghostty 2>/dev/null | base64 || true)
   printf '#!/bin/bash\nset -e\n'
   if [ -n "$ti" ]; then
-    # unquoted heredoc so $ti expands here on the Mac; inner delimiters stay literal on the box
+    # unquoted heredoc so $ti expands here on the client; inner delimiters stay literal on the box
     cat <<UD
 base64 -d > /tmp/xterm-ghostty.terminfo <<'B64_EOF'
 $ti
@@ -203,7 +203,7 @@ case "${1:-}" in
     ;;
   ssh)    ip=$(cur_ip); exec ssh -i "$PEM" ubuntu@"$ip" ;;
   tunnel) port="${2:-8150}"; ip=$(cur_ip)
-          log "tunnel: localhost:$port -> box:$port — open http://localhost:$port on the Mac (Ctrl-C closes)"
+          log "tunnel: localhost:$port -> box:$port — open http://localhost:$port in your browser (Ctrl-C closes)"
           exec ssh -i "$PEM" -N -L "${port}:localhost:${port}" ubuntu@"$ip" ;;
   push)   src="${2:-}"; [ -n "$src" ] || { log "usage: aella push <local-path> [remote-dir]"; exit 1; }
           dst="${3:-}"; ip=$(cur_ip)
@@ -224,7 +224,7 @@ case "${1:-}" in
       printf ' %s %-19s %-10s %-15s %-15s %s\n' "$mark" "$iid" "$state" "$type" "${ip:-—}" "$launch"
     done ;;
   rdp)    SGID=$(sg_id); [ -n "$SGID" ] && [ "$SGID" != None ] || { log "no security group"; exit 1; }
-          add_rdp "$SGID"; ip=$(cur_ip); echo "Microsoft Remote Desktop -> $ip:3389" ;;
+          add_rdp "$SGID"; ip=$(cur_ip); echo "connect an RDP client to $ip:3389" ;;
   status)
     IID=$(cat "$STATE" 2>/dev/null || true); [ -z "$IID" ] && { echo "no box"; exit 0; }
     aws ec2 describe-instances --instance-ids "$IID" \

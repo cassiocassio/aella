@@ -9,17 +9,18 @@ for the Amazon **Aella** — "whirlwind" — which is about the right lifespan f
 ```
 aella up                 # launch a fresh box (current LTS), print its IP + ssh line
 aella ssh                # ssh in
-aella tunnel 8150        # forward a port to your Mac's browser
+aella tunnel 8150        # forward a port to your local browser
 aella ls                 # every box you've got running — what's costing you money
 aella down               # terminate it — disk and all
 ```
 
 ## Install
 
-Needs the AWS CLI, configured:
+Needs the AWS CLI, configured — plus `ssh`, `scp`, and `curl`, all standard on macOS and
+every major Linux distro. Pure bash (3.2+), no other dependencies.
 
 ```sh
-brew install awscli        # or your platform's package
+brew install awscli        # or your platform's package manager (apt, dnf, pacman, …)
 aws configure              # set a default region + credentials
 ```
 
@@ -52,7 +53,7 @@ chmod +x ~/bin/aella
 aella up                              # spin up a box
 aella push ./clip.mp4 work/           # send it something to chew on
 aella ssh                             # ... do the work on the box ...
-aella tunnel 8150                     # view a local web server in your Mac browser
+aella tunnel 8150                     # view a web server running on the box in your browser
 aella pull work/output ./results      # bring the results back
 aella down                            # stop the meter
 ```
