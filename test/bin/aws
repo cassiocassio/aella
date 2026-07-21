@@ -1,0 +1,33 @@
+#!/bin/bash
+# Minimal AWS CLI stand-in for aella's tests. Never touches AWS.
+# Behaviour is driven by FAKE_* env vars; every "service op" is appended to
+# $AELLA_TEST_LOG so tests can assert which calls happened.
+[ "$1" = --region ] && shift 2
+svc="${1:-}"; op="${2:-}"
+[ -n "${AELLA_TEST_LOG:-}" ] && echo "$svc $op" >> "$AELLA_TEST_LOG"
+all="$*"
+case "$svc $op" in
+  "sts get-caller-identity") echo '{"Account":"123456789012"}' ;;
+  "ec2 describe-images")
+     case "$all" in
+       *"Images[].Name"*) printf '%s\t%s\n' \
+         'ubuntu/images/hvm-ssd/ubuntu-noble-24.04-amd64-server-1' \
+         'ubuntu/images/hvm-ssd-gp3/ubuntu-plucky-25.04-amd64-server-1' ;;
+       *) echo "${FAKE_AMI:-ami-1234567890}" ;;
+     esac ;;
+  "ec2 describe-instances")
+     case "$all" in
+       *tag:Name*)        printf '%s\n' "${FAKE_LS_ROWS:-}" ;;
+       *PublicIpAddress*) echo "${FAKE_IP:-1.2.3.4}" ;;
+       *State.Name*)      echo "${FAKE_STATE:-running}" ;;
+       *)                 echo "" ;;
+     esac ;;
+  "ec2 run-instances")                     echo "${FAKE_IID:-i-newbox000}" ;;
+  "ec2 terminate-instances")               echo "i-x	shutting-down" ;;
+  "ec2 wait")                              : ;;
+  "ec2 describe-security-groups")          echo "sg-123" ;;
+  "ec2 create-security-group")             echo "sg-123" ;;
+  "ec2 authorize-security-group-ingress")  : ;;
+  "ec2 create-key-pair")                   echo "FAKE-KEY-MATERIAL" ;;
+  *) : ;;
+esac

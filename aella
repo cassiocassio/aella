@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+# aella — a disposable amd64 Ubuntu box on AWS, no EC2 console ever again.
+# Whirlwind boxes: up in a gust, gone on `down`. Run `aella help` for commands.
+# Thin wrapper around the AWS CLI. One-time setup: brew install awscli && aws configure.
+set -euo pipefail
+export AWS_PAGER=""
+REGION="${AELLA_REGION:-eu-north-1}"
+TYPE="${AELLA_TYPE:-m7i-flex.large}"    # amd64, 8 GB — NOT free tier, bills per-second
+DISK="${AELLA_DISK:-20}"
+LTS="${AELLA_LTS:-24.04}"                # default Ubuntu; `up --latest` picks the newest release
+KEY=aella-key
+SG=aella-sg
+PEM="$HOME/.ssh/$KEY.pem"
+STATE="$HOME/.aella-instance"
+
+aws() { command aws --region "$REGION" "$@"; }
+log() { echo "$@" >&2; }
+
+print_help() {
+  cat <<EOF
+aella — a disposable amd64 Ubuntu box on AWS, no EC2 console.
+
+usage: aella <command> [arg]
+
+  up [--latest]  launch a fresh box (Ubuntu $LTS LTS by default; --latest = newest release)
+  ls             list every aella box from AWS tags (* = the current one)
+  ssh            ssh into the current box
+  tunnel [port]  forward localhost:port -> box:port (default 8150); open http://localhost:port
+  ip             print the current public IP
+  rdp            re-allow RDP (3389) from your current IP (GUI desktop; run after roaming)
+  status         show the current box
+  down [-y]      terminate it — irreversible, deletes the box and its disk (-y skips the prompt)
+
+env overrides:
+  AELLA_REGION   AWS region        (default $REGION)
+  AELLA_TYPE     instance type     (default $TYPE)
+  AELLA_DISK     root disk in GB   (default $DISK)
+  AELLA_LTS      Ubuntu LTS        (default $LTS)
+
+setup (once):  brew install awscli && aws configure   (region: $REGION)
+EOF
+}
+
+preflight() {  # fail early and helpfully if the AWS CLI isn't usable
+  aws sts get-caller-identity >/dev/null 2>&1 && return
+  log "aella needs the AWS CLI configured:"
+  log "  brew install awscli && aws configure     (region: $REGION)"
+  exit 1
+}
+
+ensure_key() {
+  [ -s "$PEM" ] && return
+  log "creating key pair $KEY -> $PEM"
+  # write to a temp path so a failed create never leaves a poisoned empty .pem
+  if ! aws ec2 create-key-pair --key-name "$KEY" --query KeyMaterial --output text > "$PEM.tmp" 2>/dev/null; then
+    rm -f "$PEM.tmp"
+    log "could not create key pair '$KEY'."
+    log "if it already exists in AWS but the local .pem is gone, delete it and retry:"
+    log "  aws ec2 --region $REGION delete-key-pair --key-name $KEY"
+    exit 1
+  fi
+  chmod 600 "$PEM.tmp"
+  mv "$PEM.tmp" "$PEM"
+}
+
+sg_id() { aws ec2 describe-security-groups --group-names "$SG" --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || true; }
+
+add_rdp() {  # allow RDP from current IP (idempotent-ish; ignores "already exists")
+  local id="$1" myip; myip=$(curl -s https://checkip.amazonaws.com)
+  aws ec2 authorize-security-group-ingress --group-id "$id" --protocol tcp --port 3389 --cidr "${myip}/32" >/dev/null 2>&1 || true
+  log "RDP (3389) allowed from ${myip}"
+}
+
+ensure_sg() {  # prints the group id on stdout; logs to stderr
+  local id; id=$(sg_id)
+  if [ -z "$id" ] || [ "$id" = "None" ]; then
+    log "creating security group $SG (SSH from anywhere — key-only; RDP from your IP)"
+    id=$(aws ec2 create-security-group --group-name "$SG" --description "aella disposable box" --query GroupId --output text)
+    add_rdp "$id"
+  fi
+  # re-assert the SSH rule every run — tolerates "already exists", and heals a
+  # security group that was created but never got the port-22 rule.
+  aws ec2 authorize-security-group-ingress --group-id "$id" --protocol tcp --port 22 --cidr 0.0.0.0/0 >/dev/null 2>&1 || true
+  echo "$id"
+}
+
+ubuntu_ami() {  # newest AMI id for an Ubuntu version, e.g. 24.04
+  aws ec2 describe-images --owners 099720109477 \
+    --filters "Name=name,Values=ubuntu/images/hvm-ssd*/ubuntu-*-$1-amd64-server-*" \
+              "Name=state,Values=available" \
+    --query 'sort_by(Images,&CreationDate)[-1].ImageId' --output text
+}
+
+latest_ubuntu_version() {  # highest version Canonical publishes (portable: awk max, no BSD-unfriendly sort -V)
+  aws ec2 describe-images --owners 099720109477 \
+    --filters "Name=name,Values=ubuntu/images/hvm-ssd*/ubuntu-*-amd64-server-*" \
+              "Name=state,Values=available" \
+    --query 'Images[].Name' --output text \
+    | tr '\t' '\n' \
+    | sed -E 's#.*/ubuntu-[a-z]+-([0-9]+\.[0-9]+)-amd64.*#\1#' \
+    | awk -F. '/^[0-9]+\.[0-9]+$/ { v=$1*100+$2; if (v>m) { m=v; s=$1"."$2 } } END { if (s) print s }'
+}
+
+cur_ip() {
+  local iid ip; iid=$(cat "$STATE" 2>/dev/null || true)
+  [ -z "$iid" ] && { log "no box (run: aella up)"; exit 1; }
+  ip=$(aws ec2 describe-instances --instance-ids "$iid" \
+    --query 'Reservations[0].Instances[0].PublicIpAddress' --output text 2>/dev/null || true)
+  if [ -z "$ip" ] || [ "$ip" = "None" ]; then
+    log "box $iid has no public IP (terminated, or still booting?) — check: aella status"
+    exit 1
+  fi
+  echo "$ip"
+}
+
+build_userdata() {  # emit a first-boot cloud-init shell script to stdout
+  # Embed this Mac's ghostty terminfo (base64, so arbitrary bytes survive intact)
+  # so nano/less/tput + the coloured prompt work natively on the box. Degrades
+  # gracefully: if infocmp yields nothing, the .bashrc guard below falls the box
+  # back to xterm-256color instead.
+  local ti; ti=$(infocmp -x xterm-ghostty 2>/dev/null | base64 || true)
+  printf '#!/bin/bash\nset -e\n'
+  if [ -n "$ti" ]; then
+    # unquoted heredoc so $ti expands here on the Mac; inner delimiters stay literal on the box
+    cat <<UD
+base64 -d > /tmp/xterm-ghostty.terminfo <<'B64_EOF'
+$ti
+B64_EOF
+tic -x /tmp/xterm-ghostty.terminfo 2>/dev/null || true
+UD
+  fi
+  # quoted heredoc: everything below lands verbatim in user-data and runs on the box
+  cat <<'UD'
+BASHRC=/home/ubuntu/.bashrc
+sed -i 's/^#force_color_prompt=yes/force_color_prompt=yes/' "$BASHRC" || true
+cat >> "$BASHRC" <<'BASHRC_EOF'
+
+# --- aella auto-provisioned: colour & terminal niceties ---
+[ "$TERM" = xterm-ghostty ] && ! infocmp xterm-ghostty >/dev/null 2>&1 && export TERM=xterm-256color
+export CLICOLOR=1
+alias ls='ls --color=auto -F'
+alias ll='ls -alFh --color=auto'
+alias la='ls -A --color=auto'
+alias grep='grep --color=auto'
+alias diff='diff --color=auto'
+export LESS='-R'
+export MANPAGER='less -R'
+export HISTSIZE=10000
+export HISTFILESIZE=20000
+export HISTCONTROL=ignoreboth:erasedups
+export HISTTIMEFORMAT='%F %T  '
+shopt -s histappend
+shopt -s checkwinsize
+BASHRC_EOF
+chown ubuntu:ubuntu "$BASHRC"
+UD
+}
+
+case "${1:-}" in
+  help|-h|--help) print_help ;;
+  up)
+    preflight
+    channel=lts
+    for a in "$@"; do case "$a" in --latest) channel=latest ;; --lts) channel=lts ;; esac; done
+    # refuse to orphan a box that's already up (it would keep billing untracked)
+    if [ -s "$STATE" ]; then
+      st=$(aws ec2 describe-instances --instance-ids "$(cat "$STATE")" \
+            --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || true)
+      case "$st" in
+        running|pending|stopping|stopped)
+          log "box $(cat "$STATE") already exists ($st) — 'aella down' it first, or 'aella ssh'"; exit 1 ;;
+      esac
+    fi
+    ensure_key
+    SGID=$(ensure_sg)
+    if [ "$channel" = latest ]; then
+      ver=$(latest_ubuntu_version); [ -n "$ver" ] || ver="$LTS"
+    else
+      ver="$LTS"
+    fi
+    log "finding newest Ubuntu $ver amd64 AMI ..."
+    AMI=$(ubuntu_ami "$ver")
+    [ -n "$AMI" ] && [ "$AMI" != None ] || { log "no Ubuntu $ver AMI available in $REGION"; exit 1; }
+    log "launching $TYPE from $AMI (Ubuntu $ver) ..."
+    UDFILE=$(mktemp); trap 'rm -f "$UDFILE"' EXIT
+    build_userdata > "$UDFILE"
+    IID=$(aws ec2 run-instances --image-id "$AMI" --instance-type "$TYPE" \
+      --key-name "$KEY" --security-group-ids "$SGID" \
+      --user-data "file://$UDFILE" \
+      --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":$DISK}}]" \
+      --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=aella}]' \
+      --query 'Instances[0].InstanceId' --output text)
+    echo "$IID" > "$STATE"
+    log "waiting for $IID to run ..."
+    aws ec2 wait instance-running --instance-ids "$IID"
+    IP=$(cur_ip)
+    echo
+    echo "  ● $IID  @  $IP"
+    echo "  ssh:  ssh -i $PEM ubuntu@$IP"
+    echo "  (give it ~30s to finish first boot before the first ssh)"
+    ;;
+  ssh)    ip=$(cur_ip); exec ssh -i "$PEM" ubuntu@"$ip" ;;
+  tunnel) port="${2:-8150}"; ip=$(cur_ip)
+          log "tunnel: localhost:$port -> box:$port — open http://localhost:$port on the Mac (Ctrl-C closes)"
+          exec ssh -i "$PEM" -N -L "${port}:localhost:${port}" ubuntu@"$ip" ;;
+  ip)     cur_ip ;;
+  ls)
+    cur=$(cat "$STATE" 2>/dev/null || true)
+    rows=$(aws ec2 describe-instances \
+      --filters "Name=tag:Name,Values=aella" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+      --query 'Reservations[].Instances[].[InstanceId,State.Name,InstanceType,PublicIpAddress,LaunchTime]' \
+      --output text 2>/dev/null || true)
+    [ -z "$rows" ] && { echo "no aella boxes"; exit 0; }
+    printf '%s\n' "$rows" | while IFS="$(printf '\t')" read -r iid state type ip launch; do
+      mark=" "; [ "$iid" = "$cur" ] && mark="*"
+      printf ' %s %-19s %-10s %-15s %-15s %s\n' "$mark" "$iid" "$state" "$type" "${ip:-—}" "$launch"
+    done ;;
+  rdp)    SGID=$(sg_id); [ -n "$SGID" ] && [ "$SGID" != None ] || { log "no security group"; exit 1; }
+          add_rdp "$SGID"; ip=$(cur_ip); echo "Microsoft Remote Desktop -> $ip:3389" ;;
+  status)
+    IID=$(cat "$STATE" 2>/dev/null || true); [ -z "$IID" ] && { echo "no box"; exit 0; }
+    aws ec2 describe-instances --instance-ids "$IID" \
+      --query 'Reservations[0].Instances[0].[InstanceId,State.Name,PublicIpAddress,InstanceType]' --output text ;;
+  down)
+    IID=$(cat "$STATE" 2>/dev/null || true); [ -z "$IID" ] && { echo "no box"; exit 0; }
+    if [ "${2:-}" != "-y" ] && [ "${2:-}" != "--yes" ]; then
+      printf 'terminate %s? this deletes the box and its disk. [y/N] ' "$IID"
+      read -r ans
+      case "$ans" in y|Y|yes|YES) ;; *) echo "kept"; exit 0 ;; esac
+    fi
+    aws ec2 terminate-instances --instance-ids "$IID" \
+      --query 'TerminatingInstances[0].[InstanceId,CurrentState.Name]' --output text
+    rm -f "$STATE" ;;
+  *) print_help >&2; exit 1 ;;
+esac
