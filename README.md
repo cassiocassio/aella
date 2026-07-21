@@ -24,12 +24,24 @@ brew install awscli        # or your platform's package manager (apt, dnf, pacma
 aws configure              # set a default region + credentials
 ```
 
-Then drop `aella` somewhere on your `PATH`:
+Then install `aella` onto your `PATH`. **With git** (recommended — `git pull` to update,
+and you get the tests):
 
 ```sh
-curl -o ~/bin/aella https://raw.githubusercontent.com/cassiocassio/aella/main/aella
-chmod +x ~/bin/aella
+git clone https://github.com/cassiocassio/aella ~/.aella
+ln -s ~/.aella/aella ~/.local/bin/aella      # or any dir on your PATH
 ```
+
+**Or just grab the one file:**
+
+```sh
+mkdir -p ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/cassiocassio/aella/main/aella -o ~/.local/bin/aella
+chmod +x ~/.local/bin/aella
+```
+
+Make sure the target dir is on your `PATH` (`echo $PATH`; add `~/.local/bin` if missing).
+Then `aella help`.
 
 ## Commands
 
