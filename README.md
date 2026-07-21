@@ -43,6 +43,24 @@ chmod +x ~/.local/bin/aella
 Make sure the target dir is on your `PATH` (`echo $PATH`; add `~/.local/bin` if missing).
 Then `aella help`.
 
+## Uninstall
+
+It doesn't scatter — no PATH edits, no config dir, no launch agents. Actually removable,
+which is rare for its genre:
+
+```sh
+aella down                                       # if a box is still running
+rm -rf ~/.aella ~/.local/bin/aella               # the tool (adjust to where you put it)
+rm -f  ~/.aella-instance ~/.ssh/aella-key.pem    # its only local state + the key
+```
+
+And on the AWS side, if you want it fully gone:
+
+```sh
+aws ec2 delete-key-pair --key-name aella-key
+aws ec2 delete-security-group --group-name aella-sg
+```
+
 ## Commands
 
 | command | what it does |
