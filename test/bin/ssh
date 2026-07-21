@@ -1,0 +1,4 @@
+#!/bin/bash
+# fake ssh for aella tests — logs its argv, does nothing
+[ -n "${AELLA_TEST_LOG:-}" ] && echo "ssh $*" >> "$AELLA_TEST_LOG"
+exit 0

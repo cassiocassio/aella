@@ -38,11 +38,24 @@ chmod +x ~/bin/aella
 | `aella ls` | list **every** aella box from AWS tags (`*` = the current one) — the "what am I paying for?" view, works across machines and sessions |
 | `aella ssh` | ssh into the current box |
 | `aella tunnel [port]` | `ssh -N -L port:localhost:port` (default 8150) — run a web server on the box, open `http://localhost:port` on your machine |
+| `aella push <src> [dst]` | copy a local file/dir up to the box (remote dir auto-created; default is home) |
+| `aella pull <src> [dst]` | copy a file/dir from the box back down (default: current dir) |
 | `aella ip` | print the current public IP (clean stdout, script-friendly) |
 | `aella rdp` | re-allow RDP (3389) from your *current* IP, for a GUI desktop — run again after you roam |
 | `aella status` | show the current box |
 | `aella down [-y]` | **terminate** it — irreversible, deletes the box and its disk (`-y` skips the prompt) |
 | `aella help` | this |
+
+## A typical loop
+
+```sh
+aella up                              # spin up a box
+aella push ./clip.mp4 work/           # send it something to chew on
+aella ssh                             # ... do the work on the box ...
+aella tunnel 8150                     # view a local web server in your Mac browser
+aella pull work/output ./results      # bring the results back
+aella down                            # stop the meter
+```
 
 ## Ephemeral by design
 

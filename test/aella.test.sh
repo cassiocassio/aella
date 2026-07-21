@@ -81,6 +81,24 @@ out=$(aella ls)
   && pass "ls: lists all aella boxes, marks current with *" || fail "ls" "$out"
 unset FAKE_LS_ROWS
 
+# --- push / pull: file transfer to the box --------------------------------
+sandbox; echo i-abc > "$HOME/.aella-instance"; export FAKE_IP=9.9.9.9
+: > "$SB/movie.mp4"
+aella push "$SB/movie.mp4" interviews >/dev/null 2>&1
+{ called "ssh .*mkdir -p .*interviews" && called "scp .*movie.mp4 ubuntu@9.9.9.9:interviews"; } \
+  && pass "push: makes remote dir + scp -r to ubuntu@ip:dst" || fail "push" "$(cat "$AELLA_TEST_LOG")"
+
+sandbox; echo i-abc > "$HOME/.aella-instance"; export FAKE_IP=9.9.9.9
+aella pull out/report.html ./here >/dev/null 2>&1
+called "scp .*ubuntu@9.9.9.9:out/report.html ./here" \
+  && pass "pull: scp -r from box to local dest" || fail "pull" "$(cat "$AELLA_TEST_LOG")"
+unset FAKE_IP
+
+sandbox; echo i-abc > "$HOME/.aella-instance"
+out=$(aella push 2>&1); rc=$?
+{ [ $rc -eq 1 ] && echo "$out" | grep -q usage; } \
+  && pass "push without src: usage + exit 1 (no transfer attempted)" || fail "push no-arg" "rc=$rc"
+
 # --- version picker: highest wins, portable ------------------------------
 ver=$( { sed -n '/^latest_ubuntu_version()/,/^}/p' "$AELLA"; echo latest_ubuntu_version; } \
        | env PATH="$DIR/bin:$PATH" bash )

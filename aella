@@ -26,6 +26,8 @@ usage: aella <command> [arg]
   ls             list every aella box from AWS tags (* = the current one)
   ssh            ssh into the current box
   tunnel [port]  forward localhost:port -> box:port (default 8150); open http://localhost:port
+  push <src> [d] copy a local file/dir up to the box (remote dir d auto-created; default home)
+  pull <src> [d] copy a file/dir from the box back down (default: here)
   ip             print the current public IP
   rdp            re-allow RDP (3389) from your current IP (GUI desktop; run after roaming)
   status         show the current box
@@ -203,6 +205,12 @@ case "${1:-}" in
   tunnel) port="${2:-8150}"; ip=$(cur_ip)
           log "tunnel: localhost:$port -> box:$port — open http://localhost:$port on the Mac (Ctrl-C closes)"
           exec ssh -i "$PEM" -N -L "${port}:localhost:${port}" ubuntu@"$ip" ;;
+  push)   src="${2:-}"; [ -n "$src" ] || { log "usage: aella push <local-path> [remote-dir]"; exit 1; }
+          dst="${3:-}"; ip=$(cur_ip)
+          [ -n "$dst" ] && ssh -i "$PEM" ubuntu@"$ip" "mkdir -p \"$dst\""
+          scp -i "$PEM" -r "$src" ubuntu@"$ip":"$dst" ;;
+  pull)   src="${2:-}"; [ -n "$src" ] || { log "usage: aella pull <remote-path> [local-dir]"; exit 1; }
+          ip=$(cur_ip); scp -i "$PEM" -r ubuntu@"$ip":"$src" "${3:-.}" ;;
   ip)     cur_ip ;;
   ls)
     cur=$(cat "$STATE" 2>/dev/null || true)
