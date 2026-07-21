@@ -89,6 +89,9 @@ AELLA_TYPE=c7g.8xlarge AELLA_REGION=us-east-1 aella up   # a big Graviton box
   running. `aella down` is what stops the meter. Spot pricing + a bigger `AELLA_TYPE` makes a
   good cheap-but-fast combo.
 - State lives in `~/.aella-instance` (just the current instance id). Nothing else is stored.
+- **`push`/`pull` remote paths are relative to the box's home** (`/home/ubuntu`), so
+  `aella push clip.mov work/` lands in `/home/ubuntu/work/`. An absolute path like `/data`
+  only works if `ubuntu` can write there — for a disposable box, stick to home-relative.
 
 ## Tests
 
