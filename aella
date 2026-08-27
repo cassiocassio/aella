@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# aella — a disposable amd64 Ubuntu box on AWS, no EC2 console ever again.
+# aella — a disposable amd64 Linux box on AWS, no EC2 console ever again.
 # Whirlwind boxes: up in a gust, gone on `down`. Run `aella help` for commands.
 # Thin wrapper around the AWS CLI. One-time setup: brew install awscli && aws configure.
 set -euo pipefail
@@ -8,21 +8,31 @@ REGION="${AELLA_REGION:-eu-north-1}"
 TYPE="${AELLA_TYPE:-m7i-flex.large}"    # amd64, 8 GB — NOT free tier, bills per-second
 DISK="${AELLA_DISK:-20}"
 LTS="${AELLA_LTS:-24.04}"                # default Ubuntu; `up --latest` picks the newest release
+DISTRO="${AELLA_DISTRO:-ubuntu}"         # ubuntu | fedora; `up --fedora` overrides per-run
+FEDORA="${AELLA_FEDORA:-42}"             # default Fedora release; `up --fedora --latest` picks the newest
 KEY=aella-key
 SG=aella-sg
 PEM="$HOME/.ssh/$KEY.pem"
 STATE="$HOME/.aella-instance"
+# The login name differs per distro (ubuntu / fedora), so `up` records it and
+# every later command reads it back. Boxes launched before this file existed
+# have no record and are Ubuntu by definition — hence the fallback.
+USERSTATE="$HOME/.aella-user"
+
+box_user() { cat "$USERSTATE" 2>/dev/null || echo ubuntu; }
 
 aws() { command aws --region "$REGION" "$@"; }
 log() { echo "$@" >&2; }
 
 print_help() {
   cat <<EOF
-aella — a disposable amd64 Ubuntu box on AWS, no EC2 console.
+aella — a disposable amd64 Linux box on AWS, no EC2 console.
 
 usage: aella <command> [arg]
 
-  up [--latest]  launch a fresh box (Ubuntu $LTS LTS by default; --latest = newest release)
+  up [--latest] [--fedora]
+                 launch a fresh box (Ubuntu $LTS LTS by default; --latest = newest
+                 release; --fedora = Fedora $FEDORA instead of Ubuntu)
   ls             list every aella box from AWS tags (* = the current one)
   ssh            ssh into the current box
   tunnel [port]  forward localhost:port -> box:port (default 8150); open http://localhost:port
@@ -38,6 +48,8 @@ env overrides:
   AELLA_TYPE     instance type     (default $TYPE)
   AELLA_DISK     root disk in GB   (default $DISK)
   AELLA_LTS      Ubuntu LTS        (default $LTS)
+  AELLA_DISTRO   ubuntu | fedora   (default $DISTRO)
+  AELLA_FEDORA   Fedora release    (default $FEDORA)
 
 setup (once):  brew install awscli && aws configure   (region: $REGION)
 EOF
@@ -103,6 +115,28 @@ latest_ubuntu_version() {  # highest version Canonical publishes (portable: awk 
     | awk -F. '/^[0-9]+\.[0-9]+$/ { v=$1*100+$2; if (v>m) { m=v; s=$1"."$2 } } END { if (s) print s }'
 }
 
+# Fedora publishes ELN, Rawhide and Prerelease images into the same account and
+# rebuilds them nightly, so they always sort newest. Every query below excludes
+# them by name — a bare sort_by(CreationDate)[-1] hands you Rawhide.
+FEDORA_OWNER=125523088429
+fedora_ami() {  # newest AMI id for a Fedora release, e.g. 42
+  aws ec2 describe-images --owners "$FEDORA_OWNER" \
+    --filters "Name=name,Values=Fedora-Cloud-Base-AmazonEC2.x86_64-$1-*" \
+              "Name=state,Values=available" \
+    --query 'sort_by(Images,&CreationDate)[-1].ImageId' --output text
+}
+
+latest_fedora_version() {  # highest numbered STABLE release Fedora publishes
+  aws ec2 describe-images --owners "$FEDORA_OWNER" \
+    --filters "Name=name,Values=Fedora-Cloud-Base-AmazonEC2.x86_64-*" \
+              "Name=state,Values=available" \
+    --query 'Images[].Name' --output text \
+    | tr '\t' '\n' \
+    | grep -vE 'ELN|Rawhide|Prerelease|Beta' \
+    | sed -E 's#.*\.x86_64-([0-9]+)-[0-9]{8}.*#\1#' \
+    | awk '/^[0-9]+$/ { if ($1>m) m=$1 } END { if (m) print m }'
+}
+
 cur_ip() {
   local iid ip; iid=$(cat "$STATE" 2>/dev/null || true)
   [ -z "$iid" ] && { log "no box (run: aella up)"; exit 1; }
@@ -115,7 +149,7 @@ cur_ip() {
   echo "$ip"
 }
 
-build_userdata() {  # emit a first-boot cloud-init shell script to stdout
+build_userdata() {  # emit a first-boot cloud-init shell script to stdout ($1 = login user)
   # Embed the local terminal's ghostty terminfo, if any (base64, so arbitrary bytes
   # survive intact) so nano/less/tput + the coloured prompt work natively on the box.
   # Degrades gracefully: if infocmp yields nothing (not Ghostty, or no infocmp), the
@@ -131,9 +165,12 @@ B64_EOF
 tic -x /tmp/xterm-ghostty.terminfo 2>/dev/null || true
 UD
   fi
-  # quoted heredoc: everything below lands verbatim in user-data and runs on the box
+  # the login name is the one thing that varies per distro; pass it in, then the
+  # quoted heredoc below lands verbatim in user-data and runs on the box
+  printf 'AELLA_USER=%s\n' "$1"
   cat <<'UD'
-BASHRC=/home/ubuntu/.bashrc
+BASHRC="/home/$AELLA_USER/.bashrc"
+# Debian-ism; a no-op on Fedora, whose .bashrc has no such line
 sed -i 's/^#force_color_prompt=yes/force_color_prompt=yes/' "$BASHRC" || true
 cat >> "$BASHRC" <<'BASHRC_EOF'
 
@@ -154,7 +191,7 @@ export HISTTIMEFORMAT='%F %T  '
 shopt -s histappend
 shopt -s checkwinsize
 BASHRC_EOF
-chown ubuntu:ubuntu "$BASHRC"
+chown "$AELLA_USER:$AELLA_USER" "$BASHRC"
 UD
 }
 
@@ -163,7 +200,13 @@ case "${1:-}" in
   up)
     preflight
     channel=lts
-    for a in "$@"; do case "$a" in --latest) channel=latest ;; --lts) channel=lts ;; esac; done
+    for a in "$@"; do case "$a" in
+      --latest) channel=latest ;;
+      --lts)    channel=lts ;;
+      --fedora) DISTRO=fedora ;;
+      --ubuntu) DISTRO=ubuntu ;;
+    esac; done
+    case "$DISTRO" in ubuntu|fedora) ;; *) log "unknown distro '$DISTRO' (want: ubuntu | fedora)"; exit 1 ;; esac
     # refuse to orphan a box that's already up (it would keep billing untracked)
     if [ -s "$STATE" ]; then
       st=$(aws ec2 describe-instances --instance-ids "$(cat "$STATE")" \
@@ -175,17 +218,21 @@ case "${1:-}" in
     fi
     ensure_key
     SGID=$(ensure_sg)
-    if [ "$channel" = latest ]; then
-      ver=$(latest_ubuntu_version); [ -n "$ver" ] || ver="$LTS"
+    if [ "$DISTRO" = fedora ]; then
+      LOGIN=fedora; PRETTY=Fedora
+      if [ "$channel" = latest ]; then ver=$(latest_fedora_version); [ -n "$ver" ] || ver="$FEDORA"
+      else ver="$FEDORA"; fi
     else
-      ver="$LTS"
+      LOGIN=ubuntu; PRETTY=Ubuntu
+      if [ "$channel" = latest ]; then ver=$(latest_ubuntu_version); [ -n "$ver" ] || ver="$LTS"
+      else ver="$LTS"; fi
     fi
-    log "finding newest Ubuntu $ver amd64 AMI ..."
-    AMI=$(ubuntu_ami "$ver")
-    [ -n "$AMI" ] && [ "$AMI" != None ] || { log "no Ubuntu $ver AMI available in $REGION"; exit 1; }
-    log "launching $TYPE from $AMI (Ubuntu $ver) ..."
+    log "finding newest $PRETTY $ver amd64 AMI ..."
+    if [ "$DISTRO" = fedora ]; then AMI=$(fedora_ami "$ver"); else AMI=$(ubuntu_ami "$ver"); fi
+    [ -n "$AMI" ] && [ "$AMI" != None ] || { log "no $PRETTY $ver AMI available in $REGION"; exit 1; }
+    log "launching $TYPE from $AMI ($PRETTY $ver) ..."
     UDFILE=$(mktemp); trap 'rm -f "$UDFILE"' EXIT
-    build_userdata > "$UDFILE"
+    build_userdata "$LOGIN" > "$UDFILE"
     IID=$(aws ec2 run-instances --image-id "$AMI" --instance-type "$TYPE" \
       --key-name "$KEY" --security-group-ids "$SGID" \
       --user-data "file://$UDFILE" \
@@ -193,24 +240,25 @@ case "${1:-}" in
       --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=aella}]' \
       --query 'Instances[0].InstanceId' --output text)
     echo "$IID" > "$STATE"
+    echo "$LOGIN" > "$USERSTATE"
     log "waiting for $IID to run ..."
     aws ec2 wait instance-running --instance-ids "$IID"
     IP=$(cur_ip)
     echo
-    echo "  ● $IID  @  $IP"
-    echo "  ssh:  ssh -i $PEM ubuntu@$IP"
+    echo "  ● $IID  @  $IP   ($PRETTY $ver)"
+    echo "  ssh:  ssh -i $PEM $LOGIN@$IP"
     echo "  (give it ~30s to finish first boot before the first ssh)"
     ;;
-  ssh)    ip=$(cur_ip); exec ssh -i "$PEM" ubuntu@"$ip" ;;
+  ssh)    ip=$(cur_ip); exec ssh -i "$PEM" "$(box_user)"@"$ip" ;;
   tunnel) port="${2:-8150}"; ip=$(cur_ip)
           log "tunnel: localhost:$port -> box:$port — open http://localhost:$port in your browser (Ctrl-C closes)"
-          exec ssh -i "$PEM" -N -L "${port}:localhost:${port}" ubuntu@"$ip" ;;
+          exec ssh -i "$PEM" -N -L "${port}:localhost:${port}" "$(box_user)"@"$ip" ;;
   push)   src="${2:-}"; [ -n "$src" ] || { log "usage: aella push <local-path> [remote-dir]"; exit 1; }
-          dst="${3:-}"; ip=$(cur_ip)
-          [ -n "$dst" ] && ssh -i "$PEM" ubuntu@"$ip" "mkdir -p \"$dst\""
-          scp -i "$PEM" -r "$src" ubuntu@"$ip":"$dst" ;;
+          dst="${3:-}"; ip=$(cur_ip); u=$(box_user)
+          [ -n "$dst" ] && ssh -i "$PEM" "$u"@"$ip" "mkdir -p \"$dst\""
+          scp -i "$PEM" -r "$src" "$u"@"$ip":"$dst" ;;
   pull)   src="${2:-}"; [ -n "$src" ] || { log "usage: aella pull <remote-path> [local-dir]"; exit 1; }
-          ip=$(cur_ip); scp -i "$PEM" -r ubuntu@"$ip":"$src" "${3:-.}" ;;
+          ip=$(cur_ip); scp -i "$PEM" -r "$(box_user)"@"$ip":"$src" "${3:-.}" ;;
   ip)     cur_ip ;;
   ls)
     cur=$(cat "$STATE" 2>/dev/null || true)
@@ -238,6 +286,6 @@ case "${1:-}" in
     fi
     aws ec2 terminate-instances --instance-ids "$IID" \
       --query 'TerminatingInstances[0].[InstanceId,CurrentState.Name]' --output text
-    rm -f "$STATE" ;;
+    rm -f "$STATE" "$USERSTATE" ;;
   *) print_help >&2; exit 1 ;;
 esac

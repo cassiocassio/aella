@@ -4,15 +4,24 @@
 # $AELLA_TEST_LOG so tests can assert which calls happened.
 [ "$1" = --region ] && shift 2
 svc="${1:-}"; op="${2:-}"
-[ -n "${AELLA_TEST_LOG:-}" ] && echo "$svc $op" >> "$AELLA_TEST_LOG"
 all="$*"
+[ -n "${AELLA_TEST_LOG:-}" ] && echo "$svc $op :: $all" >> "$AELLA_TEST_LOG"
 case "$svc $op" in
   "sts get-caller-identity") echo '{"Account":"123456789012"}' ;;
   "ec2 describe-images")
      case "$all" in
-       *"Images[].Name"*) printf '%s\t%s\n' \
-         'ubuntu/images/hvm-ssd/ubuntu-noble-24.04-amd64-server-1' \
-         'ubuntu/images/hvm-ssd-gp3/ubuntu-plucky-25.04-amd64-server-1' ;;
+       *"Images[].Name"*)
+         case "$all" in
+           *Fedora*) printf '%s\t%s\t%s\t%s\t%s\n' \
+             'Fedora-Cloud-Base-AmazonEC2.x86_64-41-20251215.0' \
+             'Fedora-Cloud-Base-AmazonEC2.x86_64-42-20260528.0' \
+             'Fedora-Cloud-Base-AmazonEC2.x86_64-ELN-20260827.0' \
+             'Fedora-Cloud-Base-AmazonEC2.x86_64-Rawhide-20260827.0' \
+             'Fedora-Cloud-Base-AmazonEC2.x86_64-45-Prerelease-20260827.0' ;;
+           *) printf '%s\t%s\n' \
+             'ubuntu/images/hvm-ssd/ubuntu-noble-24.04-amd64-server-1' \
+             'ubuntu/images/hvm-ssd-gp3/ubuntu-plucky-25.04-amd64-server-1' ;;
+         esac ;;
        *) echo "${FAKE_AMI:-ami-1234567890}" ;;
      esac ;;
   "ec2 describe-instances")

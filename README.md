@@ -1,6 +1,7 @@
 # aella
 
-A disposable amd64 Ubuntu box on AWS — up in a gust, gone on `down`. No EC2 console, ever.
+A disposable amd64 Linux box on AWS — Ubuntu or Fedora, up in a gust, gone on `down`.
+No EC2 console, ever.
 
 `aella` is a thin wrapper around the AWS CLI. It remembers your key pair, security group,
 instance type, and the current box, so spinning one up (or killing it) is one word. Named
@@ -8,6 +9,7 @@ for the Amazon **Aella** — "whirlwind" — which is about the right lifespan f
 
 ```
 aella up                 # launch a fresh box (current LTS), print its IP + ssh line
+aella up --fedora        # ... or a Fedora box instead
 aella ssh                # ssh in
 aella tunnel 8150        # forward a port to your local browser
 aella ls                 # every box you've got running — what's costing you money
@@ -65,7 +67,7 @@ aws ec2 delete-security-group --group-name aella-sg
 
 | command | what it does |
 |---|---|
-| `aella up [--latest]` | launch a fresh box (current LTS by default; `--latest` = newest Ubuntu release), auto-provisions the shell, prints IP + ssh line |
+| `aella up [--latest] [--fedora]` | launch a fresh box (Ubuntu LTS by default; `--latest` = newest release of the chosen distro; `--fedora` = Fedora instead), auto-provisions the shell, prints IP + ssh line |
 | `aella ls` | list **every** aella box from AWS tags (`*` = the current one) — the "what am I paying for?" view, works across machines and sessions |
 | `aella ssh` | ssh into the current box |
 | `aella tunnel [port]` | `ssh -N -L port:localhost:port` (default 8150) — run a web server on the box, open `http://localhost:port` on your machine |
@@ -91,7 +93,7 @@ aella down                            # stop the meter
 ## Ephemeral by design
 
 `down` **terminates** (deletes the root disk); `up` launches a **brand-new** box from the
-latest Ubuntu 24.04 AMI. Every cycle is a fresh disk and a new public IP — so don't keep
+latest Ubuntu 24.04 AMI — or, with `--fedora`, the latest Fedora image. Every cycle is a fresh disk and a new public IP — so don't keep
 state on the box. That's also why `up` bakes first-boot provisioning (coloured prompt, sane
 history, ls/grep colours; and if you use [Ghostty](https://ghostty.org), its terminfo so
 `nano`/`less` just work) into the machine via cloud-init — a fresh box comes up configured.
@@ -104,6 +106,8 @@ Override the defaults with env vars — handy for renting bigger or odd silicon:
 |---|---|---|
 | `AELLA_REGION` | `eu-north-1` | AWS region |
 | `AELLA_TYPE` | `m7i-flex.large` | instance type (amd64, 8 GB — **not** free tier) |
+| `AELLA_DISTRO` | `ubuntu` | `ubuntu` or `fedora` (per-run: `up --fedora`) |
+| `AELLA_FEDORA` | `42` | Fedora release to launch |
 | `AELLA_DISK` | `20` | root disk, GB |
 | `AELLA_LTS` | `24.04` | which LTS `up` uses by default |
 
@@ -113,23 +117,31 @@ AELLA_TYPE=c7g.8xlarge AELLA_REGION=us-east-1 aella up   # a big Graviton box
 
 ## Notes
 
-- **SSH is open to `0.0.0.0/0`** but **key-only** (password auth off on Ubuntu AMIs). The key
+- **SSH is open to `0.0.0.0/0`** but **key-only** (password auth off on both Ubuntu and Fedora
+  cloud AMIs). The key
   pair is created on first `up` and saved to `~/.ssh/aella-key.pem`. RDP, if you use it, is
   scoped to your current IP only.
 - **This costs money.** The default instance type is not free-tier and bills per second while
   running. `aella down` is what stops the meter. Spot pricing + a bigger `AELLA_TYPE` makes a
   good cheap-but-fast combo.
-- State lives in `~/.aella-instance` (just the current instance id). Nothing else is stored.
-- **`push`/`pull` remote paths are relative to the box's home** (`/home/ubuntu`), so
-  `aella push clip.mov work/` lands in `/home/ubuntu/work/`. An absolute path like `/data`
-  only works if `ubuntu` can write there — for a disposable box, stick to home-relative.
+- State lives in `~/.aella-instance` (the current instance id) and `~/.aella-user` (its login
+  name, since Ubuntu and Fedora images differ). Nothing else is stored. A box launched before
+  `~/.aella-user` existed is assumed to be Ubuntu.
+- **`push`/`pull` remote paths are relative to the box's home** (`/home/ubuntu`, or
+  `/home/fedora`), so `aella push clip.mov work/` lands in `~/work/`. An absolute path like
+  `/data` only works if the login user can write there — for a disposable box, stick to
+  home-relative.
+- **Fedora releases: only stable ones.** Fedora publishes ELN, Rawhide and Prerelease images
+  into the same AWS account and rebuilds them nightly, so they always sort newest — `up
+  --fedora --latest` filters them out and takes the highest numbered stable release.
 
 ## Tests
 
 `bash test/aella.test.sh` — unit tests that mock the AWS CLI (`test/bin/aws`), so they
 never touch AWS or spend a cent. They pin the parts where a regression would cost money or
 lock you out: the orphan-billing guard, the `down` confirmation, the no-empty-host ssh guard,
-and the user-data heredocs. Not an end-to-end test — for that, do one real `up`/`down` cycle.
+the user-data heredocs, and — for Fedora — that the release picker skips the Rawhide/ELN
+decoys and that every `ssh`/`push`/`pull` follows the box's real login name. Not an end-to-end test — for that, do one real `up`/`down` cycle.
 
 ## Licence
 

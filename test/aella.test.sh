@@ -33,8 +33,8 @@ out=$(aella bogus 2>/dev/null); rc=$?
 { [ $rc -eq 1 ] && [ -z "$out" ]; } && pass "unknown cmd: exit 1, help to stderr (stdout empty)" || fail "unknown cmd" "rc=$rc out='$out'"
 
 # --- build_userdata: valid shell both ways (nested heredocs are the risk) ---
-gen_ud() { # $1 = infocmp stub body
-  { printf '%s\n' "$1"; sed -n '/^build_userdata()/,/^}/p' "$AELLA"; echo build_userdata; } | bash
+gen_ud() { # $1 = infocmp stub body, $2 = login user (default ubuntu)
+  { printf '%s\n' "$1"; sed -n '/^build_userdata()/,/^}/p' "$AELLA"; echo "build_userdata ${2:-ubuntu}"; } | bash
 }
 ud=$(gen_ud 'infocmp() { return 1; }')
 { printf '%s' "$ud" | bash -n && printf '%s' "$ud" | grep -q force_color_prompt; } \
@@ -103,6 +103,57 @@ out=$(aella push 2>&1); rc=$?
 ver=$( { sed -n '/^latest_ubuntu_version()/,/^}/p' "$AELLA"; echo latest_ubuntu_version; } \
        | env PATH="$DIR/bin:$PATH" bash )
 [ "$ver" = "25.04" ] && pass "latest_ubuntu_version: picks highest (25.04)" || fail "version picker" "got '$ver'"
+
+# --- fedora: version picker must skip Rawhide / ELN / Prerelease ----------
+ver=$( { sed -n '/^FEDORA_OWNER=/,/^}/p' "$AELLA"; sed -n '/^latest_fedora_version()/,/^}/p' "$AELLA"; echo latest_fedora_version; } \
+       | env PATH="$DIR/bin:$PATH" bash )
+[ "$ver" = "42" ] && pass "latest_fedora_version: picks highest STABLE (42, not Rawhide/ELN/45-Prerelease)" \
+  || fail "fedora version picker" "got '$ver' — a decoy image leaked through"
+
+# --- fedora: build_userdata follows the login user ------------------------
+ud=$(gen_ud 'infocmp() { return 1; }' fedora)
+{ printf '%s' "$ud" | bash -n && printf '%s' "$ud" | grep -q '^AELLA_USER=fedora$' \
+    && printf '%s' "$ud" | grep -q 'BASHRC="/home/\$AELLA_USER/.bashrc"' \
+    && ! printf '%s' "$ud" | grep -q 'chown ubuntu:ubuntu'; } \
+  && pass "build_userdata fedora: user-parameterised bashrc path + chown" || fail "build_userdata fedora" "$ud"
+
+# --- fedora: up --fedora queries Fedora images and records the login ------
+sandbox
+aella up --fedora >/dev/null 2>&1
+{ called "describe-images .*Fedora-Cloud-Base-AmazonEC2.x86_64-42" \
+    && called "run-instances" \
+    && [ "$(cat "$HOME/.aella-user" 2>/dev/null)" = fedora ]; } \
+  && pass "up --fedora: Fedora AMI filter, launches, records login 'fedora'" \
+  || fail "up --fedora" "$(cat "$AELLA_TEST_LOG")"
+
+# --- fedora: ssh/push/pull follow the recorded login ----------------------
+sandbox; echo i-abc > "$HOME/.aella-instance"; echo fedora > "$HOME/.aella-user"
+export FAKE_IP=9.9.9.9
+aella ssh >/dev/null 2>&1
+called "ssh .*fedora@9.9.9.9" && pass "ssh: uses the recorded fedora login" || fail "ssh fedora" "$(cat "$AELLA_TEST_LOG")"
+: > "$SB/clip.mp4"
+aella push "$SB/clip.mp4" recordings >/dev/null 2>&1
+called "scp .*clip.mp4 fedora@9.9.9.9:recordings" && pass "push: scp to fedora@ip" || fail "push fedora" "$(cat "$AELLA_TEST_LOG")"
+aella pull out/report.html . >/dev/null 2>&1
+called "scp .*fedora@9.9.9.9:out/report.html" && pass "pull: scp from fedora@ip" || fail "pull fedora" "$(cat "$AELLA_TEST_LOG")"
+unset FAKE_IP
+
+# --- a box launched before .aella-user existed is Ubuntu, not a crash -----
+sandbox; echo i-legacy > "$HOME/.aella-instance"; export FAKE_IP=7.7.7.7
+aella ssh >/dev/null 2>&1
+called "ssh .*ubuntu@7.7.7.7" && pass "no login record (pre-Fedora box): falls back to ubuntu" || fail "legacy fallback" "$(cat "$AELLA_TEST_LOG")"
+unset FAKE_IP
+
+# --- down clears the login record too, or the next box inherits it --------
+sandbox; echo i-abc > "$HOME/.aella-instance"; echo fedora > "$HOME/.aella-user"
+aella down -y >/dev/null 2>&1
+[ ! -f "$HOME/.aella-user" ] && pass "down -y: clears the login record with the box" || fail "down leaves stale login record"
+
+# --- an unknown distro is refused before anything is launched -------------
+sandbox
+out=$(env AELLA_DISTRO=arch bash "$AELLA" up 2>&1); rc=$?
+{ [ $rc -eq 1 ] && ! called "run-instances"; } \
+  && pass "unknown distro: refuses, launches nothing" || fail "distro validation" "rc=$rc"
 
 echo
 echo "  $PASS passed, $FAIL failed"
