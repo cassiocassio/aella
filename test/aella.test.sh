@@ -13,9 +13,10 @@ fail() { echo "  ✗ $1"; [ -n "${2:-}" ] && echo "     $2"; FAIL=$((FAIL + 1));
 # and the fake aws first on PATH. FAKE_* env vars steer the mock.
 sandbox() {
   SB=$(mktemp -d); mkdir -p "$SB/.ssh"
-  export HOME="$SB" AELLA_TEST_LOG="$SB/calls.log"
+  export HOME="$SB" TMPDIR="$SB" AELLA_TEST_LOG="$SB/calls.log" AELLA_PW_POLL=0
   : > "$AELLA_TEST_LOG"
-  unset FAKE_STATE FAKE_IP FAKE_LS_ROWS FAKE_IID FAKE_AMI
+  unset FAKE_STATE FAKE_IP FAKE_LS_ROWS FAKE_IID FAKE_AMI FAKE_MYIP FAKE_PW FAKE_SSM FAKE_SG_CIDRS \
+        FAKE_PBCOPY_FAIL FAKE_OPEN_FAIL FAKE_PW_ERR FAKE_KEYGEN_FAIL FAKE_NO_KEYPAIR AELLA_PW_TIMEOUT AELLA_DISK AELLA_TYPE
 }
 aella() { env PATH="$DIR/bin:$PATH" bash "$AELLA" "$@"; }
 called() { grep -q "$1" "$AELLA_TEST_LOG"; }
@@ -154,6 +155,158 @@ sandbox
 out=$(env AELLA_DISTRO=arch bash "$AELLA" up 2>&1); rc=$?
 { [ $rc -eq 1 ] && ! called "run-instances"; } \
   && pass "unknown distro: refuses, launches nothing" || fail "distro validation" "rc=$rc"
+
+# --- linux up is unchanged by Windows support ------------------------------
+sandbox
+aella up >/dev/null 2>&1
+{ called "group-names aella-sg " && ! called "aella-win-sg" && called "run-instances .*m7i-flex.large" \
+    && called 'VolumeSize":20' && ! called "authorize-security-group-ingress .*3389" \
+    && called "Key=aella-os,Value=ubuntu"; } \
+  && pass "up (ubuntu): aella-sg, m7i-flex.large, 20 GB, no RDP rule added, tagged ubuntu" \
+  || fail "linux up regressed" "$(cat "$AELLA_TEST_LOG")"
+
+# --- key pairs are per-region: a moved region imports the existing key ------
+sandbox; echo "PEM" > "$HOME/.ssh/aella-key.pem"; export FAKE_NO_KEYPAIR=notfound
+aella up >/dev/null 2>&1
+{ called "import-key-pair --key-name aella-key" && ! called "create-key-pair"; } \
+  && pass "up in a region without the key pair: imports the local key (doesn't fail at launch)" \
+  || fail "key import" "$(cat "$AELLA_TEST_LOG")"
+sandbox; echo "PEM" > "$HOME/.ssh/aella-key.pem"; export FAKE_NO_KEYPAIR=denied
+aella up >/dev/null 2>&1
+{ ! called "import-key-pair" && called "run-instances"; } \
+  && pass "no ec2:DescribeKeyPairs permission: no import attempt, launches as before" \
+  || fail "key check w/o permission" "$(cat "$AELLA_TEST_LOG")"
+
+# --- windows: up launches the right thing, scoped to your IP ---------------
+PW='Sup3r$ecret;pw'
+sandbox; export FAKE_PW="$PW"
+out=$(aella up --windows 2>&1); rc=$?
+{ [ $rc -eq 0 ] && called "ssm get-parameter --name /aws/service/ami-windows-latest/Windows_Server-2025-English-Full-Base" \
+    && called "run-instances --image-id ami-win2025 --instance-type m7i-flex.large" \
+    && called 'VolumeSize":30' && called "Key=aella-os,Value=windows" \
+    && [ "$(cat "$HOME/.aella-user" 2>/dev/null)" = Administrator ]; } \
+  && pass "up --windows: SSM AMI, m7i-flex.large, 30 GB, tagged, records Administrator" \
+  || fail "up --windows" "rc=$rc $out $(cat "$AELLA_TEST_LOG")"
+{ called "authorize-security-group-ingress .*--port 3389 --cidr 203.0.113.7/32" \
+    && called "authorize-security-group-ingress .*--port 22 --cidr 203.0.113.7/32" \
+    && ! called "authorize.*0.0.0.0/0" && ! called "group-names aella-sg "; } \
+  && pass "up --windows: RDP + SSH from your /32 only, via aella-win-sg (aella-sg untouched)" \
+  || fail "windows ingress scope" "$(cat "$AELLA_TEST_LOG")"
+{ [ "$(cat "$HOME/clipboard" 2>/dev/null)" = "$PW" ] && ! echo "$out" | grep -qF "$PW" \
+    && ! grep -qF "$PW" "$AELLA_TEST_LOG" && echo "$out" | grep -q clipboard; } \
+  && pass "up --windows: password goes to the clipboard, never to the terminal or argv" \
+  || fail "password handling" "$out"
+called "get-password-data .*--priv-launch-key $HOME/.ssh/aella-key.pem" \
+  && pass "up --windows: decrypts with the aella key" || fail "priv-launch-key" "$(cat "$AELLA_TEST_LOG")"
+
+sandbox; export FAKE_PW="$PW" AELLA_TYPE=t3.large
+aella up --windows >/dev/null 2>&1
+called "run-instances .*--instance-type t3.large" \
+  && pass "up --windows: AELLA_TYPE still overrides" || fail "windows type override" "$(cat "$AELLA_TEST_LOG")"
+
+sandbox; export AELLA_DISK=20
+out=$(aella up --windows 2>&1); rc=$?
+{ [ $rc -eq 1 ] && ! called "run-instances" && echo "$out" | grep -q ">= 30"; } \
+  && pass "up --windows with AELLA_DISK=20: refuses before launching" || fail "windows disk floor" "rc=$rc $out"
+
+# --- windows: failure paths ------------------------------------------------
+sandbox; export FAKE_PW="$PW" FAKE_SSM=denied
+aella up --windows >/dev/null 2>&1
+{ called "describe-images --owners amazon .*Windows_Server-2025-English-Full-Base-\*" && called "run-instances"; } \
+  && pass "no ssm:GetParameter: falls back to EC2's newest Amazon Windows image" || fail "ssm fallback" "$(cat "$AELLA_TEST_LOG")"
+
+sandbox; export FAKE_SSM=denied FAKE_AMI=None
+out=$(aella up --windows 2>&1); rc=$?
+{ [ $rc -eq 1 ] && ! called "run-instances" && echo "$out" | grep -q "no Windows Server 2025 AMI"; } \
+  && pass "region without the AMI: clear error, launches nothing" || fail "no AMI" "rc=$rc $out"
+
+sandbox; export FAKE_MYIP=""
+out=$(aella up --windows 2>&1); rc=$?
+{ [ $rc -eq 1 ] && ! called "run-instances" && ! called "authorize-security-group-ingress"; } \
+  && pass "public-IP lookup fails: no '/32' rule, launches nothing" || fail "my_ip guard" "rc=$rc $out"
+
+sandbox; export AELLA_PW_TIMEOUT=0 FAKE_PW_ERR=1
+out=$(aella up --windows 2>&1); rc=$?
+{ [ $rc -eq 1 ] && echo "$out" | grep -q "no password after" && echo "$out" | grep -q "UnauthorizedOperation" \
+    && [ -s "$HOME/.aella-instance" ]; } \
+  && pass "password timeout: exits 1, shows the real error, box stays tracked (aella down still works)" || fail "pw timeout" "rc=$rc $out"
+
+sandbox; export FAKE_PW="$PW" FAKE_PBCOPY_FAIL=1
+out=$(aella up --windows 2>&1)
+f=$(ls "$SB"/aella-pw.* 2>/dev/null | head -1)
+{ [ -n "$f" ] && [ "$(cat "$f")" = "$PW" ] && ls -l "$f" | grep -q '^-rw-------' && ! echo "$out" | grep -qF "$PW"; } \
+  && pass "no clipboard: password in a 0600 temp file, still not printed" || fail "pw file fallback" "$out"
+
+sandbox; export FAKE_PW="$PW" FAKE_KEYGEN_FAIL=1
+aella up --windows >/dev/null 2>&1; rc=$?
+{ [ $rc -eq 0 ] && called "run-instances"; } \
+  && pass "unreadable key for user-data: still launches (RDP only)" || fail "keygen fail" "rc=$rc"
+
+# --- windows: user-data ------------------------------------------------------
+# (ends at the next function: the PowerShell inside has its own lines starting with '}')
+gen_wud() { { sed -n '/^build_userdata_windows()/,/^wait_password()/p' "$AELLA" | sed '$d'; printf 'build_userdata_windows %q\n' "$1"; } | bash; }
+ud=$(gen_wud 'ssh-rsa AAAAB3NzaC1yc2EKEY')
+{ printf '%s' "$ud" | head -1 | grep -q '^<powershell>$' && printf '%s' "$ud" | tail -1 | grep -q '^</powershell>$' \
+    && printf '%s' "$ud" | grep -qF "\$key = 'ssh-rsa AAAAB3NzaC1yc2EKEY'" \
+    && printf '%s' "$ud" | grep -qF 'administrators_authorized_keys' \
+    && printf '%s' "$ud" | grep -qF "/inheritance:r /grant '*S-1-5-32-544:F' /grant '*S-1-5-18:F'" \
+    && printf '%s' "$ud" | grep -qF "@('PasswordAuthentication no', 'KbdInteractiveAuthentication no')" \
+    && [ "$(printf '%s' "$ud" | grep -n 'StartupType Automatic' | cut -d: -f1)" -lt "$(printf '%s' "$ud" | grep -n '^Start-Service sshd; Stop' | cut -d: -f1)" ]; } \
+  && pass "build_userdata_windows: key-only sshd, locked-ACL admin key, un-disables sshd before starting it" || fail "windows user-data" "$ud"
+ud=$(gen_wud "ssh-rsa AAAA'; Remove-Item C:\\ -Recurse; '"); rc=$?
+{ [ $rc -ne 0 ] && [ -z "$ud" ]; } && pass "build_userdata_windows: refuses a key that could break out of its quotes" \
+  || fail "windows user-data injection" "$ud"
+
+# --- windows: rdp -------------------------------------------------------------
+sandbox; echo i-win > "$HOME/.aella-instance"; echo Administrator > "$HOME/.aella-user"
+export FAKE_IP=9.9.9.9 FAKE_PW="$PW" FAKE_SG_CIDRS="$(printf '198.51.100.9/32\t203.0.113.7/32')"
+out=$(aella rdp 2>&1); rc=$?
+rdpf=$(sed -n 's/^open //p' "$AELLA_TEST_LOG" | head -1)
+{ [ $rc -eq 0 ] && [ -n "$rdpf" ] && grep -q '^full address:s:9.9.9.9:3389' "$rdpf" \
+    && grep -q '^username:s:Administrator' "$rdpf" && ls -l "$rdpf" | grep -q '^-rw-------' \
+    && ls -ld "$(dirname "$rdpf")" | grep -q '^drwx------'; } \
+  && pass "rdp (windows): writes a 0600 .rdp (address + Administrator) in a 0700 dir, opens it" \
+  || fail "rdp windows" "rc=$rc $out $(cat "$AELLA_TEST_LOG")"
+{ [ "$(cat "$HOME/clipboard" 2>/dev/null)" = "$PW" ] && ! echo "$out" | grep -qF "$PW" && ! grep -qF "$PW" "$rdpf"; } \
+  && pass "rdp (windows): password to clipboard only — not printed, not in the .rdp" || fail "rdp password" "$out"
+{ called "revoke-security-group-ingress .*--cidr 198.51.100.9/32" && ! called "revoke.*203.0.113.7"; } \
+  && pass "rdp (windows): re-allows your current IP and revokes the one you roamed from" \
+  || fail "rdp roaming" "$(cat "$AELLA_TEST_LOG")"
+
+sandbox; echo i-win > "$HOME/.aella-instance"; echo Administrator > "$HOME/.aella-user"
+export FAKE_IP=9.9.9.9 FAKE_PW="$PW" FAKE_OPEN_FAIL=1
+out=$(aella rdp 2>&1); rc=$?
+{ [ $rc -eq 1 ] && echo "$out" | grep -q "Windows App"; } \
+  && pass "rdp with no .rdp handler: install hint for Windows App, exit 1" || fail "rdp no handler" "rc=$rc $out"
+
+sandbox; echo i-lin > "$HOME/.aella-instance"
+export FAKE_IP=9.9.9.9
+out=$(aella rdp 2>&1)
+{ called "authorize-security-group-ingress --group-id sg-123 .*3389" && ! called "^open " \
+    && ! called "get-password-data" && echo "$out" | grep -q "connect an RDP client to 9.9.9.9:3389"; } \
+  && pass "rdp (linux box): unchanged — re-allows 3389 on aella-sg, no password, no .rdp" \
+  || fail "rdp linux regressed" "$out $(cat "$AELLA_TEST_LOG")"
+unset FAKE_IP FAKE_PW FAKE_SG_CIDRS FAKE_OPEN_FAIL
+
+# --- windows: ssh / push follow Administrator + PowerShell -----------------
+sandbox; echo i-win > "$HOME/.aella-instance"; echo Administrator > "$HOME/.aella-user"
+export FAKE_IP=9.9.9.9
+aella ssh >/dev/null 2>&1
+: > "$SB/report.xlsx"
+aella push "$SB/report.xlsx" inbox >/dev/null 2>&1
+{ called "ssh .*Administrator@9.9.9.9" && called "New-Item -ItemType Directory -Force -Path \"inbox\"" \
+    && ! called "mkdir -p" && called "scp .*report.xlsx Administrator@9.9.9.9:inbox"; } \
+  && pass "ssh/push (windows): Administrator login, PowerShell mkdir" || fail "windows ssh/push" "$(cat "$AELLA_TEST_LOG")"
+unset FAKE_IP
+
+# --- ls shows the platform --------------------------------------------------
+sandbox
+export FAKE_LS_ROWS="$(printf 'i-win\trunning\tt3.large\t1.2.3.4\t2026-10-05\twindows\twindows\ni-fed\trunning\tm7i-flex.large\t5.6.7.8\t2026-10-05\tNone\tfedora\ni-old\trunning\tm7i-flex.large\t5.6.7.9\t2026-07-20\tNone\tNone')"
+out=$(aella ls)
+{ echo "$out" | grep -q 'i-win .* windows ' && echo "$out" | grep -q 'i-fed .* fedora ' \
+    && echo "$out" | grep -q 'i-old .* linux '; } \
+  && pass "ls: shows each box's platform (tag, else EC2 platform)" || fail "ls platform" "$out"
+unset FAKE_LS_ROWS
 
 echo
 echo "  $PASS passed, $FAIL failed"

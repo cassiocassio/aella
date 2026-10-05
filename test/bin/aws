@@ -24,6 +24,17 @@ case "$svc $op" in
          esac ;;
        *) echo "${FAKE_AMI:-ami-1234567890}" ;;
      esac ;;
+  "ssm get-parameter")
+     [ "${FAKE_SSM:-}" = denied ] && { echo "AccessDeniedException: not authorized to perform: ssm:GetParameter" >&2; exit 254; }
+     echo "${FAKE_WIN_AMI:-ami-win2025}" ;;
+  "ec2 get-password-data")
+     [ -n "${FAKE_PW_ERR:-}" ] && { echo "UnauthorizedOperation: cannot decrypt" >&2; exit 254; }
+     echo "${FAKE_PW:-}" ;;
+  "ec2 describe-key-pairs")
+     case "${FAKE_NO_KEYPAIR:-}" in
+       notfound) echo "An error occurred (InvalidKeyPair.NotFound)" >&2; exit 254 ;;
+       denied)   echo "An error occurred (UnauthorizedOperation)" >&2; exit 254 ;;
+     esac ;;
   "ec2 describe-instances")
      case "$all" in
        *tag:Name*)        printf '%s\n' "${FAKE_LS_ROWS:-}" ;;
@@ -34,7 +45,11 @@ case "$svc $op" in
   "ec2 run-instances")                     echo "${FAKE_IID:-i-newbox000}" ;;
   "ec2 terminate-instances")               echo "i-x	shutting-down" ;;
   "ec2 wait")                              : ;;
-  "ec2 describe-security-groups")          echo "sg-123" ;;
+  "ec2 describe-security-groups")
+     case "$all" in
+       *IpPermissions*) printf '%s\n' "${FAKE_SG_CIDRS:-}" ;;
+       *)               echo "sg-123" ;;
+     esac ;;
   "ec2 create-security-group")             echo "sg-123" ;;
   "ec2 authorize-security-group-ingress")  : ;;
   "ec2 create-key-pair")                   echo "FAKE-KEY-MATERIAL" ;;

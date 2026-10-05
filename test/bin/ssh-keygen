@@ -1,0 +1,4 @@
+#!/bin/bash
+# fake ssh-keygen for aella tests — `-y` prints a public key. FAKE_KEYGEN_FAIL = unreadable .pem.
+[ -n "${FAKE_KEYGEN_FAIL:-}" ] && exit 1
+echo "ssh-rsa AAAAB3NzaC1yc2EFAKEKEY"

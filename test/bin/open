@@ -1,0 +1,4 @@
+#!/bin/bash
+# fake macOS open for aella tests — logs its argv. FAKE_OPEN_FAIL = no app handles the file.
+[ -n "${AELLA_TEST_LOG:-}" ] && echo "open $*" >> "$AELLA_TEST_LOG"
+[ -z "${FAKE_OPEN_FAIL:-}" ]

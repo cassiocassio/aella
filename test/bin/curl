@@ -1,0 +1,4 @@
+#!/bin/bash
+# fake curl for aella tests — the "what's my public IP" lookup. FAKE_MYIP="" = lookup failed.
+[ -n "${AELLA_TEST_LOG:-}" ] && echo "curl $*" >> "$AELLA_TEST_LOG"
+printf '%s\n' "${FAKE_MYIP-203.0.113.7}"

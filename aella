@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# aella — a disposable amd64 Linux box on AWS, no EC2 console ever again.
+# aella — a disposable amd64 Linux (or Windows) box on AWS, no EC2 console ever again.
 # Whirlwind boxes: up in a gust, gone on `down`. Run `aella help` for commands.
 # Thin wrapper around the AWS CLI. One-time setup: brew install awscli && aws configure.
 set -euo pipefail
@@ -7,11 +7,16 @@ export AWS_PAGER=""
 REGION="${AELLA_REGION:-eu-north-1}"
 TYPE="${AELLA_TYPE:-m7i-flex.large}"    # amd64, 8 GB — NOT free tier, bills per-second
 DISK="${AELLA_DISK:-20}"
+WIN_DISK="${AELLA_DISK:-30}"            # the Windows AMI's own snapshot is 30 GB; it can't go smaller
 LTS="${AELLA_LTS:-24.04}"                # default Ubuntu; `up --latest` picks the newest release
-DISTRO="${AELLA_DISTRO:-ubuntu}"         # ubuntu | fedora; `up --fedora` overrides per-run
+DISTRO="${AELLA_DISTRO:-ubuntu}"         # ubuntu | fedora | windows; `up --fedora` / `--windows` override per-run
 FEDORA="${AELLA_FEDORA:-42}"             # default Fedora release; `up --fedora --latest` picks the newest
 KEY=aella-key
 SG=aella-sg
+WIN_SG=aella-win-sg                      # Windows gets its own group: RDP + SSH from your IP only
+WIN_AMI_PARAM=/aws/service/ami-windows-latest/Windows_Server-2025-English-Full-Base
+PW_TIMEOUT="${AELLA_PW_TIMEOUT:-900}"    # seconds to wait for Windows to post its password (1-4 min typical)
+PW_POLL="${AELLA_PW_POLL:-15}"
 PEM="$HOME/.ssh/$KEY.pem"
 STATE="$HOME/.aella-instance"
 # The login name differs per distro (ubuntu / fedora), so `up` records it and
@@ -20,36 +25,46 @@ STATE="$HOME/.aella-instance"
 USERSTATE="$HOME/.aella-user"
 
 box_user() { cat "$USERSTATE" 2>/dev/null || echo ubuntu; }
+is_windows() { [ "$(box_user)" = Administrator ]; }
 
 aws() { command aws --region "$REGION" "$@"; }
 log() { echo "$@" >&2; }
 
 print_help() {
   cat <<EOF
-aella — a disposable amd64 Linux box on AWS, no EC2 console.
+aella — a disposable amd64 Linux (or Windows) box on AWS, no EC2 console.
 
 usage: aella <command> [arg]
 
-  up [--latest] [--fedora]
+  up [--latest] [--fedora | --windows]
                  launch a fresh box (Ubuntu $LTS LTS by default; --latest = newest
-                 release; --fedora = Fedora $FEDORA instead of Ubuntu)
+                 release; --fedora = Fedora $FEDORA instead of Ubuntu; --windows =
+                 Windows Server 2025, waits 1-4 min for its password)
   ls             list every aella box from AWS tags (* = the current one)
   ssh            ssh into the current box
   tunnel [port]  forward localhost:port -> box:port (default 8150); open http://localhost:port
   push <src> [d] copy a local file/dir up to the box (remote dir d auto-created; default home)
   pull <src> [d] copy a file/dir from the box back down (default: here)
   ip             print the current public IP
-  rdp            re-allow RDP (3389) from your current IP (GUI desktop; run after roaming)
+  rdp            Windows box: password to clipboard + open a Remote Desktop session
+                 (also re-allows your current IP). Linux box: re-allow RDP (3389) from your IP
   status         show the current box
   down [-y]      terminate it — irreversible, deletes the box and its disk (-y skips the prompt)
 
 env overrides:
   AELLA_REGION   AWS region        (default $REGION)
   AELLA_TYPE     instance type     (default $TYPE)
-  AELLA_DISK     root disk in GB   (default $DISK)
+  AELLA_DISK     root disk in GB   (default $DISK; Windows $WIN_DISK, its minimum)
   AELLA_LTS      Ubuntu LTS        (default $LTS)
-  AELLA_DISTRO   ubuntu | fedora   (default $DISTRO)
+  AELLA_DISTRO   ubuntu | fedora | windows   (default $DISTRO)
   AELLA_FEDORA   Fedora release    (default $FEDORA)
+  AELLA_PW_TIMEOUT  seconds to wait for the Windows password (default $PW_TIMEOUT)
+
+cost: every box bills per second while it exists (down stops it). Windows adds a
+  licence to the hourly rate: m7i-flex.large is ~\$0.18-0.20/hr all-in (eu-north-1
+  \$0.189, us-east-1 \$0.183, eu-west-2 \$0.198; Oct 2026 on-demand). AELLA_TYPE=t3.large
+  is ~\$0.11-0.12/hr, but free-plan AWS accounts can't launch it. Plus ~\$0.005/hr for
+  the public IP, and its 30 GB disk (~\$2.50/month, pro rata, until down).
 
 setup (once):  brew install awscli && aws configure   (region: $REGION)
 EOF
@@ -63,7 +78,21 @@ preflight() {  # fail early and helpfully if the AWS CLI isn't usable
 }
 
 ensure_key() {
-  [ -s "$PEM" ] && return
+  if [ -s "$PEM" ]; then
+    # the .pem is global but key pairs are per-region: switching AELLA_REGION
+    # would otherwise fail at launch with InvalidKeyPair.NotFound
+    # (only on an explicit NotFound — a user without ec2:DescribeKeyPairs carries on as before)
+    case "$(aws ec2 describe-key-pairs --key-names "$KEY" 2>&1 >/dev/null || true)" in
+      *InvalidKeyPair.NotFound*) ;; *) return ;;
+    esac
+    log "importing key pair $KEY into $REGION (public half of $PEM)"
+    local pub; pub=$(mktemp)
+    if ! ssh-keygen -y -f "$PEM" > "$pub" 2>/dev/null \
+       || ! aws ec2 import-key-pair --key-name "$KEY" --public-key-material "fileb://$pub" >/dev/null; then
+      rm -f "$pub"; log "could not import $KEY into $REGION"; exit 1
+    fi
+    rm -f "$pub"; return
+  fi
   log "creating key pair $KEY -> $PEM"
   # write to a temp path so a failed create never leaves a poisoned empty .pem
   if ! aws ec2 create-key-pair --key-name "$KEY" --query KeyMaterial --output text > "$PEM.tmp" 2>/dev/null; then
@@ -96,6 +125,46 @@ ensure_sg() {  # prints the group id on stdout; logs to stderr
   # security group that was created but never got the port-22 rule.
   aws ec2 authorize-security-group-ingress --group-id "$id" --protocol tcp --port 22 --cidr 0.0.0.0/0 >/dev/null 2>&1 || true
   echo "$id"
+}
+
+my_ip() {  # your public IPv4 — validated, so a failed lookup can never become a "/32" (or wider) rule
+  local ip; ip=$(curl -fsS --max-time 10 https://checkip.amazonaws.com 2>/dev/null || true)
+  case "$ip" in ""|*[!0-9.]*) log "could not determine your public IP (checkip.amazonaws.com)"; return 1 ;; esac
+  echo "$ip"
+}
+
+ensure_win_sg() {  # Windows-only group: RDP + SSH from your CURRENT IP only; prints the id
+  # A separate group, so Windows never widens aella-sg (whose SSH is 0.0.0.0/0, key-only on Linux).
+  local id ip port old
+  ip=$(my_ip) || exit 1
+  id=$(aws ec2 describe-security-groups --group-names "$WIN_SG" --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || true)
+  if [ -z "$id" ] || [ "$id" = None ]; then
+    log "creating security group $WIN_SG (RDP + SSH from your IP only)"
+    id=$(aws ec2 create-security-group --group-name "$WIN_SG" --description "aella Windows box: RDP+SSH from one IP" --query GroupId --output text)
+  fi
+  for port in 3389 22; do
+    aws ec2 authorize-security-group-ingress --group-id "$id" --protocol tcp --port "$port" --cidr "$ip/32" >/dev/null 2>&1 || true
+    # revoke the IPs you've since roamed away from, so the group only ever trusts where you are now
+    for old in $(aws ec2 describe-security-groups --group-ids "$id" \
+                   --query "SecurityGroups[0].IpPermissions[?ToPort==\`$port\`].IpRanges[].CidrIp" --output text 2>/dev/null || true); do
+      [ "$old" = "$ip/32" ] || [ "$old" = None ] || \
+        aws ec2 revoke-security-group-ingress --group-id "$id" --protocol tcp --port "$port" --cidr "$old" >/dev/null 2>&1 || true
+    done
+  done
+  log "RDP (3389) + SSH (22) allowed from $ip only"
+  echo "$id"
+}
+
+windows_ami() {  # newest Windows Server 2025 English Full Base, x86_64
+  local id
+  id=$(aws ssm get-parameter --name "$WIN_AMI_PARAM" --query Parameter.Value --output text 2>/dev/null || true)
+  case "$id" in ami-*) echo "$id"; return ;; esac
+  # no ssm:GetParameter (narrowly scoped IAM users often lack it)? ask EC2 for Amazon's own images
+  log "(SSM lookup unavailable — asking EC2 for Amazon's newest Windows Server 2025 image)"
+  aws ec2 describe-images --owners amazon \
+    --filters "Name=name,Values=Windows_Server-2025-English-Full-Base-*" \
+              "Name=architecture,Values=x86_64" "Name=state,Values=available" \
+    --query 'sort_by(Images,&CreationDate)[-1].ImageId' --output text 2>/dev/null || true
 }
 
 ubuntu_ami() {  # newest AMI id for an Ubuntu version, e.g. 24.04
@@ -147,6 +216,108 @@ cur_ip() {
     exit 1
   fi
   echo "$ip"
+}
+
+build_userdata_windows() {  # first-boot PowerShell (EC2Launch) enabling key-only sshd ($1 = public key)
+  # Only the PUBLIC key ever goes into user-data (which anyone with ec2:Describe* on the
+  # instance can read). Refuse anything that isn't a plain one-line key, since it's
+  # spliced into a single-quoted PowerShell string.
+  case "$1" in ssh-rsa\ *|ssh-ed25519\ *) ;; *) return 1 ;; esac
+  case "$1" in *\'*|*$'\n'*) return 1 ;; esac
+  echo '<powershell>'
+  printf "\$key = '%s'\n" "$1"
+  cat <<'UD'
+$ErrorActionPreference = 'Stop'
+# one status line on the serial console, so `aws ec2 get-console-output` shows how this went
+function Say($m) {
+  try { $p = New-Object System.IO.Ports.SerialPort COM1; $p.Open(); $p.WriteLine("aella-sshd: $m"); $p.Close() } catch {}
+}
+try {
+# OpenSSH Server ships with Windows Server 2025, but *disabled* — Start-Service fails until
+# the startup type changes. Older images need the capability added first.
+if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) {
+  Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null
+}
+Set-Service sshd -StartupType Automatic
+Start-Service sshd; Stop-Service sshd   # first start writes host keys + sshd_config
+$cfg = "$env:ProgramData\ssh\sshd_config"
+# key-only: sshd takes the FIRST value of a setting, so these go at the very top
+Set-Content $cfg -Encoding ascii -Value (@('PasswordAuthentication no', 'KbdInteractiveAuthentication no') + (Get-Content $cfg))
+# admins' keys live here, not in ~\.ssh, and sshd ignores the file unless only Administrators + SYSTEM can touch it
+$auth = "$env:ProgramData\ssh\administrators_authorized_keys"
+Set-Content -Path $auth -Value $key -Encoding ascii
+icacls.exe $auth /inheritance:r /grant '*S-1-5-32-544:F' /grant '*S-1-5-18:F' | Out-Null
+if (-not (Test-Path HKLM:\SOFTWARE\OpenSSH)) { New-Item -Path HKLM:\SOFTWARE\OpenSSH | Out-Null }
+New-ItemProperty -Path HKLM:\SOFTWARE\OpenSSH -Name DefaultShell -PropertyType String -Force `
+  -Value "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" | Out-Null
+# our own rule: the built-in OpenSSH one doesn't cover EC2's (Public) network profile.
+# The host firewall opens 22 to all; the aella-win-sg security group is what limits it to your IP.
+New-NetFirewallRule -Name aella-sshd -DisplayName 'aella: OpenSSH Server (sshd)' -Profile Any `
+  -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 | Out-Null
+Start-Service sshd
+Say 'ok'
+} catch { Say "failed: $_" }
+</powershell>
+UD
+}
+
+wait_password() {  # $1 = instance id. Prints the Administrator password on stdout — callers
+  # only ever capture it, never echo it. Windows posts it (encrypted to our key) once first
+  # boot finishes: AWS says allow ~4 min; Server 2025 on m7i-flex.large measured 33-60 s.
+  local start=$SECONDS pw said=""
+  while :; do
+    pw=$(aws ec2 get-password-data --instance-id "$1" --priv-launch-key "$PEM" \
+           --query PasswordData --output text 2>/dev/null || true)
+    if [ -n "$pw" ] && [ "$pw" != None ]; then
+      [ -n "$said" ] && log " ready after $(( (SECONDS - start) / 60 ))m$(( (SECONDS - start) % 60 ))s"
+      printf '%s' "$pw"; return 0
+    fi
+    if [ $((SECONDS - start)) -ge "$PW_TIMEOUT" ]; then
+      [ -n "$said" ] && log
+      # one last try with stderr showing (stdout, where a password would go, discarded),
+      # so a real failure — a key that can't decrypt, missing permission — isn't just "timeout"
+      aws ec2 get-password-data --instance-id "$1" --priv-launch-key "$PEM" >/dev/null || true
+      return 1
+    fi
+    if [ -z "$said" ]; then
+      printf '%s' "waiting for the Windows password (usually 1-4 min; Ctrl-C is safe — 'aella rdp' fetches it later) " >&2
+      said=1
+    fi
+    printf . >&2; sleep "$PW_POLL"
+  done
+}
+
+to_clipboard() {  # $1 = text. Via stdin, so it never shows up in a process list.
+  if command -v pbcopy >/dev/null 2>&1; then printf '%s' "$1" | pbcopy
+  elif command -v wl-copy >/dev/null 2>&1; then printf '%s' "$1" | wl-copy
+  elif command -v xclip >/dev/null 2>&1; then printf '%s' "$1" | xclip -selection clipboard
+  else return 1; fi
+}
+
+deliver_password() {  # $1 = password: clipboard if possible, else a 0600 temp file — never the terminal
+  if to_clipboard "$1" 2>/dev/null; then
+    log "Administrator password copied to your clipboard — paste it at the RDP login"
+    return
+  fi
+  local t="${TMPDIR:-/tmp}" f; f=$(mktemp "${t%/}/aella-pw.XXXXXX")   # mktemp creates it 0600
+  chmod 600 "$f"; printf '%s\n' "$1" > "$f"
+  log "no clipboard tool found — Administrator password is in $f (mode 600; delete it when done)"
+}
+
+open_rdp() {  # $1 = box ip. Writes a minimal .rdp into a private temp dir and hands it to the OS.
+  local t="${TMPDIR:-/tmp}" d f; d=$(mktemp -d "${t%/}/aella-rdp.XXXXXX")   # 0700
+  f="$d/aella.rdp"
+  (umask 077; printf 'full address:s:%s:3389\r\nusername:s:Administrator\r\n' "$1" > "$f")
+  if [ "$(uname)" = Darwin ]; then
+    open "$f" 2>/dev/null && { log "opened $f"; return; }
+    log "nothing on this Mac opens .rdp files — install Microsoft's free Windows App, then rerun 'aella rdp':"
+    log "  https://apps.apple.com/app/windows-app/id1295203466"
+  elif command -v xdg-open >/dev/null 2>&1 && xdg-open "$f" >/dev/null 2>&1; then
+    log "opened $f"; return
+  else
+    log "no RDP client found — e.g. 'xfreerdp /v:$1 /u:Administrator', or open $f in Remmina"
+  fi
+  return 1
 }
 
 build_userdata() {  # emit a first-boot cloud-init shell script to stdout ($1 = login user)
@@ -205,8 +376,14 @@ case "${1:-}" in
       --lts)    channel=lts ;;
       --fedora) DISTRO=fedora ;;
       --ubuntu) DISTRO=ubuntu ;;
+      --windows) DISTRO=windows ;;
     esac; done
-    case "$DISTRO" in ubuntu|fedora) ;; *) log "unknown distro '$DISTRO' (want: ubuntu | fedora)"; exit 1 ;; esac
+    case "$DISTRO" in ubuntu|fedora|windows) ;; *) log "unknown distro '$DISTRO' (want: ubuntu | fedora | windows)"; exit 1 ;; esac
+    if [ "$DISTRO" = windows ]; then
+      DISK="$WIN_DISK"
+      case "$DISK" in ""|*[!0-9]*) DISK=0 ;; esac
+      [ "$DISK" -ge 30 ] || { log "Windows needs AELLA_DISK >= 30 (its image is 30 GB)"; exit 1; }
+    fi
     # refuse to orphan a box that's already up (it would keep billing untracked)
     if [ -s "$STATE" ]; then
       st=$(aws ec2 describe-instances --instance-ids "$(cat "$STATE")" \
@@ -217,8 +394,11 @@ case "${1:-}" in
       esac
     fi
     ensure_key
-    SGID=$(ensure_sg)
-    if [ "$DISTRO" = fedora ]; then
+    if [ "$DISTRO" = windows ]; then SGID=$(ensure_win_sg); else SGID=$(ensure_sg); fi
+    if [ "$DISTRO" = windows ]; then
+      LOGIN=Administrator; PRETTY="Windows Server"; ver=2025
+      [ "$channel" = latest ] && log "(--latest ignored: Windows Server 2025 is the only Windows image)"
+    elif [ "$DISTRO" = fedora ]; then
       LOGIN=fedora; PRETTY=Fedora
       if [ "$channel" = latest ]; then ver=$(latest_fedora_version); [ -n "$ver" ] || ver="$FEDORA"
       else ver="$FEDORA"; fi
@@ -228,22 +408,45 @@ case "${1:-}" in
       else ver="$LTS"; fi
     fi
     log "finding newest $PRETTY $ver amd64 AMI ..."
-    if [ "$DISTRO" = fedora ]; then AMI=$(fedora_ami "$ver"); else AMI=$(ubuntu_ami "$ver"); fi
-    [ -n "$AMI" ] && [ "$AMI" != None ] || { log "no $PRETTY $ver AMI available in $REGION"; exit 1; }
+    case "$DISTRO" in
+      windows) AMI=$(windows_ami) ;;
+      fedora)  AMI=$(fedora_ami "$ver") ;;
+      *)       AMI=$(ubuntu_ami "$ver") ;;
+    esac
+    case "$AMI" in ami-*) ;; *) log "no $PRETTY $ver AMI available in $REGION"; exit 1 ;; esac
     log "launching $TYPE from $AMI ($PRETTY $ver) ..."
     UDFILE=$(mktemp); trap 'rm -f "$UDFILE"' EXIT
-    build_userdata "$LOGIN" > "$UDFILE"
+    if [ "$DISTRO" = windows ]; then
+      # user-data only enables sshd; RDP works without it, so a key we can't read just means RDP-only
+      build_userdata_windows "$(ssh-keygen -y -f "$PEM" 2>/dev/null || true)" > "$UDFILE" \
+        || log "(couldn't derive a public key from $PEM — RDP only, no ssh on this box)"
+    else
+      build_userdata "$LOGIN" > "$UDFILE"
+    fi
     IID=$(aws ec2 run-instances --image-id "$AMI" --instance-type "$TYPE" \
       --key-name "$KEY" --security-group-ids "$SGID" \
       --user-data "file://$UDFILE" \
       --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":$DISK}}]" \
-      --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=aella}]' \
+      --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=aella},{Key=aella-os,Value=$DISTRO}]" \
       --query 'Instances[0].InstanceId' --output text)
     echo "$IID" > "$STATE"
     echo "$LOGIN" > "$USERSTATE"
     log "waiting for $IID to run ..."
     aws ec2 wait instance-running --instance-ids "$IID"
     IP=$(cur_ip)
+    if [ "$DISTRO" = windows ]; then
+      if ! PW=$(wait_password "$IID"); then
+        log "no password after ${PW_TIMEOUT}s. The box is still running (and billing) and tracked:"
+        log "  'aella rdp' keeps waiting for it, or 'aella down' to give up"
+        exit 1
+      fi
+      deliver_password "$PW"; PW=""
+      echo
+      echo "  ● $IID  @  $IP   ($PRETTY $ver, $TYPE)"
+      echo "  rdp:  aella rdp      (user Administrator)"
+      echo "  ssh:  aella ssh      (key-only; PowerShell; sshd may need another minute)"
+      exit 0
+    fi
     echo
     echo "  ● $IID  @  $IP   ($PRETTY $ver)"
     echo "  ssh:  ssh -i $PEM $LOGIN@$IP"
@@ -255,7 +458,10 @@ case "${1:-}" in
           exec ssh -i "$PEM" -N -L "${port}:localhost:${port}" "$(box_user)"@"$ip" ;;
   push)   src="${2:-}"; [ -n "$src" ] || { log "usage: aella push <local-path> [remote-dir]"; exit 1; }
           dst="${3:-}"; ip=$(cur_ip); u=$(box_user)
-          [ -n "$dst" ] && ssh -i "$PEM" "$u"@"$ip" "mkdir -p \"$dst\""
+          if [ -n "$dst" ]; then
+            if is_windows; then ssh -i "$PEM" "$u"@"$ip" "New-Item -ItemType Directory -Force -Path \"$dst\" | Out-Null"
+            else ssh -i "$PEM" "$u"@"$ip" "mkdir -p \"$dst\""; fi
+          fi
           scp -i "$PEM" -r "$src" "$u"@"$ip":"$dst" ;;
   pull)   src="${2:-}"; [ -n "$src" ] || { log "usage: aella pull <remote-path> [local-dir]"; exit 1; }
           ip=$(cur_ip); scp -i "$PEM" -r "$(box_user)"@"$ip":"$src" "${3:-.}" ;;
@@ -264,15 +470,26 @@ case "${1:-}" in
     cur=$(cat "$STATE" 2>/dev/null || true)
     rows=$(aws ec2 describe-instances \
       --filters "Name=tag:Name,Values=aella" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
-      --query 'Reservations[].Instances[].[InstanceId,State.Name,InstanceType,PublicIpAddress,LaunchTime]' \
+      --query 'Reservations[].Instances[].[InstanceId,State.Name,InstanceType,PublicIpAddress,LaunchTime,Platform,Tags[?Key==`aella-os`]|[0].Value]' \
       --output text 2>/dev/null || true)
     [ -z "$rows" ] && { echo "no aella boxes"; exit 0; }
-    printf '%s\n' "$rows" | while IFS="$(printf '\t')" read -r iid state type ip launch; do
+    printf '%s\n' "$rows" | while IFS="$(printf '\t')" read -r iid state type ip launch plat os; do
       mark=" "; [ "$iid" = "$cur" ] && mark="*"
-      printf ' %s %-19s %-10s %-15s %-15s %s\n' "$mark" "$iid" "$state" "$type" "${ip:-—}" "$launch"
+      # the aella-os tag names the distro; boxes from before the tag fall back to EC2's own platform
+      case "${os:-None}" in None) [ "$plat" = windows ] && os=windows || os=linux ;; esac
+      printf ' %s %-19s %-10s %-15s %-8s %-15s %s\n' "$mark" "$iid" "$state" "$type" "$os" "${ip:-—}" "$launch"
     done ;;
-  rdp)    SGID=$(sg_id); [ -n "$SGID" ] && [ "$SGID" != None ] || { log "no security group"; exit 1; }
-          add_rdp "$SGID"; ip=$(cur_ip); echo "connect an RDP client to $ip:3389" ;;
+  rdp)
+    if is_windows; then
+      ip=$(cur_ip); ensure_win_sg >/dev/null
+      PW=$(wait_password "$(cat "$STATE")") || { log "Windows hasn't posted its password yet — try again in a minute"; exit 1; }
+      deliver_password "$PW"; PW=""
+      open_rdp "$ip" || exit 1
+      echo "connect to $ip:3389 as Administrator"
+    else
+      SGID=$(sg_id); [ -n "$SGID" ] && [ "$SGID" != None ] || { log "no security group"; exit 1; }
+      add_rdp "$SGID"; ip=$(cur_ip); echo "connect an RDP client to $ip:3389"
+    fi ;;
   status)
     IID=$(cat "$STATE" 2>/dev/null || true); [ -z "$IID" ] && { echo "no box"; exit 0; }
     aws ec2 describe-instances --instance-ids "$IID" \

@@ -1,0 +1,4 @@
+#!/bin/bash
+# fake pbcopy for aella tests — the "clipboard" is $HOME/clipboard. FAKE_PBCOPY_FAIL = no clipboard.
+[ -n "${FAKE_PBCOPY_FAIL:-}" ] && exit 1
+cat > "$HOME/clipboard"
