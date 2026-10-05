@@ -228,6 +228,23 @@ ver=$( { sed -n '/^latest_ubuntu_version()/,/^}/p' "$AELLA"; echo latest_ubuntu_
        | env PATH="$DIR/bin:$PATH" bash )
 [ "$ver" = "25.04" ] && pass "latest_ubuntu_version: picks highest (25.04)" || fail "version picker" "got '$ver'"
 
+# --- host keys: aella's own known_hosts, accept-new, reset per box ---------
+sandbox; echo i-abc > "$HOME/.aella-instance"; export FAKE_IP=9.9.9.9
+HK="-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$HOME/.ssh/aella_known_hosts"
+: > "$SB/f.txt"
+aella ssh >/dev/null 2>&1; aella tunnel 8150 >/dev/null 2>&1
+aella push "$SB/f.txt" d >/dev/null 2>&1; aella pull f.txt "$SB" >/dev/null 2>&1
+{ [ "$(grep -c -e "^ssh .*$HK" -e "^scp .*$HK" "$AELLA_TEST_LOG")" -eq 5 ] && ! grep -E '^(ssh|scp) ' "$AELLA_TEST_LOG" | grep -vqF -- "$HK"; } \
+  && pass "ssh/tunnel/push/pull: accept-new into aella's own known_hosts (works with no terminal)" \
+  || fail "host key options" "$(cat "$AELLA_TEST_LOG")"
+unset FAKE_IP
+sandbox; echo stale > "$HOME/.ssh/aella_known_hosts"; aella up >/dev/null 2>&1
+[ ! -e "$HOME/.ssh/aella_known_hosts" ] && pass "up: forgets the previous box's host key" || fail "up known_hosts reset"
+sandbox; echo i-abc > "$HOME/.aella-instance"; echo stale > "$HOME/.ssh/aella_known_hosts"; echo x > "$HOME/.ssh/known_hosts"
+aella down -y >/dev/null 2>&1
+{ [ ! -e "$HOME/.ssh/aella_known_hosts" ] && [ -s "$HOME/.ssh/known_hosts" ]; } \
+  && pass "down: clears aella's known_hosts, never touches ~/.ssh/known_hosts" || fail "down known_hosts"
+
 # --- fedora: version picker must skip Rawhide / ELN / Prerelease ----------
 ver=$( { sed -n '/^FEDORA_OWNER=/,/^}/p' "$AELLA"; sed -n '/^latest_fedora_version()/,/^}/p' "$AELLA"; echo latest_fedora_version; } \
        | env PATH="$DIR/bin:$PATH" bash )

@@ -55,7 +55,7 @@ which is rare for its genre:
 aella down                                       # if a box is still running
 rm -rf ~/.aella ~/.local/bin/aella               # the tool (adjust to where you put it)
 rm -rf ~/.aella-instance ~/.aella-user ~/.aella-region ~/.aella-lock   # its only local state
-rm -f  ~/.ssh/aella-key.pem                                             # ... and the key
+rm -f  ~/.ssh/aella-key.pem ~/.ssh/aella_known_hosts                   # ... the key, box host keys
 ```
 
 And on the AWS side, if you want it fully gone:
@@ -227,6 +227,12 @@ On the first `up` in a new region, aella imports your existing key pair there.
   away with the owner's pid. A lock left by a crashed or killed run is noticed (its pid is
   gone, or isn't aella any more) and cleared. If it ever blocks you wrongly,
   `rm -rf ~/.aella-lock`. `ssh`, `push`, `ls` and the rest don't take it.
+- **Host keys.** aella keeps its boxes' SSH host keys in `~/.ssh/aella_known_hosts`, not
+  your `~/.ssh/known_hosts`, and `up`/`down` reset it: every box is new and public IPs get
+  reused, so your main file would fill with stale entries and "host identification has
+  changed" errors. A new box's key is trusted on first contact (`StrictHostKeyChecking=
+  accept-new`, no prompt, so `ssh`/`push`/`pull` also work from scripts and agents with no
+  terminal) and a changed key is refused for the rest of that box's life.
 - **`push`/`pull` remote paths are relative to the box's home** (`/home/ubuntu`,
   `/home/fedora`, or `C:\Users\Administrator`), so `aella push clip.mov work/` lands in `~/work/`. An absolute path like
   `/data` only works if the login user can write there — for a disposable box, stick to

@@ -19,6 +19,12 @@ WIN_AMI_PARAM=/aws/service/ami-windows-latest/Windows_Server-2025-English-Full-B
 PW_TIMEOUT="${AELLA_PW_TIMEOUT:-900}"    # seconds to wait for Windows to post its password (1-4 min typical)
 PW_POLL="${AELLA_PW_POLL:-15}"
 PEM="$HOME/.ssh/$KEY.pem"
+# Host keys of aella boxes go in their own file, reset by up and down: every box is new, and
+# public IPs get reused, so ~/.ssh/known_hosts would soon cry "host identification changed".
+# accept-new trusts a box's key on first contact (no prompt, so it works without a terminal)
+# and refuses a changed one for the rest of the box's life.
+KNOWN_HOSTS="$HOME/.ssh/aella_known_hosts"
+SSH_OPTS=(-i "$PEM" -o StrictHostKeyChecking=accept-new -o "UserKnownHostsFile=$KNOWN_HOSTS")
 STATE="$HOME/.aella-instance"
 # The login name differs per distro (ubuntu / fedora), so `up` records it and
 # every later command reads it back. Boxes launched before this file existed
@@ -540,6 +546,7 @@ case "${1:-}" in
     echo "$LOGIN" > "$USERSTATE"
     echo "$REGION" > "$REGIONSTATE"
     echo "$IID" > "$STATE"
+    rm -f "$KNOWN_HOSTS"   # a new box: forget the last one's host key
     log "waiting for $IID to run ..."
     aws ec2 wait instance-running --instance-ids "$IID"
     IP=$(cur_ip)
@@ -558,22 +565,22 @@ case "${1:-}" in
     fi
     echo
     echo "  ● $IID  @  $IP   ($PRETTY $ver)"
-    echo "  ssh:  ssh -i $PEM $LOGIN@$IP"
+    echo "  ssh:  aella ssh   (or: ssh -i $PEM $LOGIN@$IP)"
     echo "  (give it ~30s to finish first boot before the first ssh)"
     ;;
-  ssh)    ip=$(cur_ip); exec ssh -i "$PEM" "$(box_user)"@"$ip" ;;
+  ssh)    ip=$(cur_ip); exec ssh "${SSH_OPTS[@]}" "$(box_user)"@"$ip" ;;
   tunnel) port="${2:-8150}"; ip=$(cur_ip)
           log "tunnel: localhost:$port -> box:$port — open http://localhost:$port in your browser (Ctrl-C closes)"
-          exec ssh -i "$PEM" -N -L "${port}:localhost:${port}" "$(box_user)"@"$ip" ;;
+          exec ssh "${SSH_OPTS[@]}" -N -L "${port}:localhost:${port}" "$(box_user)"@"$ip" ;;
   push)   src="${2:-}"; [ -n "$src" ] || { log "usage: aella push <local-path> [remote-dir]"; exit 1; }
           dst="${3:-}"; ip=$(cur_ip); u=$(box_user)
           if [ -n "$dst" ]; then
-            if is_windows; then ssh -i "$PEM" "$u"@"$ip" "New-Item -ItemType Directory -Force -Path \"$dst\" | Out-Null"
-            else ssh -i "$PEM" "$u"@"$ip" "mkdir -p \"$dst\""; fi
+            if is_windows; then ssh "${SSH_OPTS[@]}" "$u"@"$ip" "New-Item -ItemType Directory -Force -Path \"$dst\" | Out-Null"
+            else ssh "${SSH_OPTS[@]}" "$u"@"$ip" "mkdir -p \"$dst\""; fi
           fi
-          scp -i "$PEM" -r "$src" "$u"@"$ip":"$dst" ;;
+          scp "${SSH_OPTS[@]}" -r "$src" "$u"@"$ip":"$dst" ;;
   pull)   src="${2:-}"; [ -n "$src" ] || { log "usage: aella pull <remote-path> [local-dir]"; exit 1; }
-          ip=$(cur_ip); scp -i "$PEM" -r "$(box_user)"@"$ip":"$src" "${3:-.}" ;;
+          ip=$(cur_ip); scp "${SSH_OPTS[@]}" -r "$(box_user)"@"$ip":"$src" "${3:-.}" ;;
   ip)     cur_ip ;;
   ls)
     # AELLA_REGION (or the default), plus wherever the current box lives if that's elsewhere
@@ -623,6 +630,6 @@ case "${1:-}" in
     fi
     aws ec2 terminate-instances --instance-ids "$IID" \
       --query 'TerminatingInstances[0].[InstanceId,CurrentState.Name]' --output text
-    rm -f "$STATE" "$USERSTATE" "$REGIONSTATE" ;;
+    rm -f "$STATE" "$USERSTATE" "$REGIONSTATE" "$KNOWN_HOSTS" ;;
   *) print_help >&2; exit 1 ;;
 esac
