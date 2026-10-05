@@ -159,7 +159,8 @@ aella down               # stop the meter (the licence is billed with the instan
 - **Disk:** 60 GB by default. 30 GB is the image's own size and the floor (`AELLA_DISK`
   can't go below it), but it's tight: after Python, a pipx-installed app (~560 MB venv)
   and a 1.5 GB Whisper model, only ~2 GB was left. Windows grows `C:` to fill the disk
-  (59.5 GB usable on 60). A clean Server 2025 install plus those tools used about 24 GB.
+  (59.5 GB usable on 60). A fresh Server 2025 box uses about 23 GB of that before you
+  install anything, leaving ~36 GB free.
 - **Cost.** The Windows licence is billed per second on top of the instance, and only while
   the box exists. On-demand, Oct 2026, licence included:
 
@@ -287,7 +288,11 @@ real AWS:
 - **`ls`:** listed both boxes with the region column, marking only the tracked one.
 - **`down`:** cleared all three state files and the known-hosts file. AWS reported the
   box `terminated`.
-- **Windows disk:** `C:` was 59.5 GB on the 60 GB default.
+- **Fresh `up --windows`** (default 60 GB disk): up in 62 s, password ready 33 s after
+  `running`, `aella-sshd: ok` on the serial console. The root volume was 60 GB gp3, and
+  `C:` was 59.5 GB with 36.2 GB free. Over ssh: sshd running and automatic,
+  `PasswordAuthentication no`, the admin key file readable only by SYSTEM and
+  Administrators, and a password-only login refused (`Permission denied (publickey)`).
 - **`aella-win-sg` pruning** (decoys from the reserved documentation ranges, on both 22
   and 3389):
   - `rdp --only-here` removed a timestamped decoy and kept the current IP.
@@ -295,8 +300,7 @@ real AWS:
     IP and the two newest decoys. It removed the oldest and the untimestamped one.
   - Each run refreshed the current IP's timestamp in place, with no duplicate rule.
 
-Not covered live: the 60 GB default on a fresh `up --windows` (the disk was checked on a
-box launched with `AELLA_DISK=60`), and a crashed run's stale lock (the unit tests cover it).
+Not covered live: a crashed run's stale lock (the unit tests cover it).
 
 To run a live cycle without disturbing a box you already have, give it a throwaway `HOME`.
 Copy `~/.ssh/aella-key.pem` into it, and point `AWS_CONFIG_FILE` and
