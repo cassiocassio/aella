@@ -181,12 +181,12 @@ aella down               # stop the meter (the licence is billed with the instan
 
 ## Config
 
-Override the defaults with env vars — handy for renting bigger or odd silicon:
+Override the defaults with env vars — handy for renting a bigger box:
 
 | var | default | |
 |---|---|---|
 | `AELLA_REGION` | `eu-north-1` | AWS region `up` launches in (later commands follow the box; see below) |
-| `AELLA_TYPE` | `m7i-flex.large` | instance type (amd64, 8 GB — **not** free tier) |
+| `AELLA_TYPE` | `m7i-flex.large` | instance type (8 GB — **not** free tier). Must be amd64 (x86_64): aella only looks up amd64 images |
 | `AELLA_DISTRO` | `ubuntu` | `ubuntu`, `fedora` or `windows` (per-run: `up --fedora` / `up --windows`) |
 | `AELLA_FEDORA` | `42` | Fedora release to launch |
 | `AELLA_DISK` | `20` | root disk, GB (Windows: `60`; `30` minimum) |
@@ -195,8 +195,13 @@ Override the defaults with env vars — handy for renting bigger or odd silicon:
 | `AELLA_WIN_IPS` | `3` | how many of your most recent IPs `aella-win-sg` keeps open |
 
 ```sh
-AELLA_TYPE=c7g.8xlarge AELLA_REGION=us-east-1 aella up   # a big Graviton box
+AELLA_TYPE=c7i.8xlarge AELLA_REGION=us-east-1 aella up   # a big box: 32 vCPU, 64 GB
 ```
+
+`AELLA_TYPE` has to be an amd64 type (Intel `…i`, AMD `…a`, or older ones like `t3`). aella
+only looks up amd64 images, so an arm64 Graviton type (`c7g`, `m7g`, `t4g`…) fails at
+launch. Free-plan AWS accounts can only launch a few small types, such as `m7i-flex.large`
+and `c7i-flex.large`; bigger ones need a paid plan.
 
 `up` launches in `AELLA_REGION` and records it in `~/.aella-region`. Every later command
 about that box (`ssh`, `tunnel`, `push`, `pull`, `ip`, `rdp`, `status`, `down`) goes to the
