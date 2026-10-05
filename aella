@@ -23,6 +23,9 @@ STATE="$HOME/.aella-instance"
 # every later command reads it back. Boxes launched before this file existed
 # have no record and are Ubuntu by definition — hence the fallback.
 USERSTATE="$HOME/.aella-user"
+# ...and the region it was launched in, so later commands find it whatever AELLA_REGION
+# says now. No record (a box from before this file) means AELLA_REGION / default, as before.
+REGIONSTATE="$HOME/.aella-region"
 
 # up and down hold this while they read and rewrite the state above: two at once could
 # launch two boxes and track only one, which then bills unseen. A directory, because
@@ -31,10 +34,25 @@ LOCK="$HOME/.aella-lock"
 HAVE_LOCK=
 
 box_user() { cat "$USERSTATE" 2>/dev/null || echo ubuntu; }
+box_region() { cat "$REGIONSTATE" 2>/dev/null || true; }
 is_windows() { [ "$(box_user)" = Administrator ]; }
 
 aws() { command aws --region "$REGION" "$@"; }
+aws_in() { local r="$1"; shift; command aws --region "$r" "$@"; }   # $1 = region
 log() { echo "$@" >&2; }
+
+follow_box() {  # $1 = command name. Point every later aws call at the tracked box's region.
+  local r; r=$(box_region)
+  if [ ! -s "$STATE" ] || [ -z "$r" ]; then return 0; fi   # no box, or tracked before regions were
+  # An explicit AELLA_REGION that disagrees is refused, not obeyed (it would miss the box) and
+  # not silently overridden (you may think you're working on a different box than you are).
+  if [ -n "${AELLA_REGION:-}" ] && [ "$AELLA_REGION" != "$r" ]; then
+    log "the current box ($(cat "$STATE")) is in $r, but AELLA_REGION=$AELLA_REGION."
+    log "  unset AELLA_REGION and aella follows the box, or: AELLA_REGION=$r aella $1"
+    exit 1
+  fi
+  REGION="$r"
+}
 
 print_help() {
   cat <<EOF
@@ -46,7 +64,8 @@ usage: aella <command> [arg]
                  launch a fresh box (Ubuntu $LTS LTS by default; --latest = newest
                  release; --fedora = Fedora $FEDORA instead of Ubuntu; --windows =
                  Windows Server 2025, waits 1-4 min for its password)
-  ls             list every aella box from AWS tags (* = the current one)
+  ls             list every aella box from AWS tags (* = the current one), in AELLA_REGION
+                 and the current box's region
   ssh            ssh into the current box
   tunnel [port]  forward localhost:port -> box:port (default 8150); open http://localhost:port
   push <src> [d] copy a local file/dir up to the box (remote dir d auto-created; default home)
@@ -58,6 +77,8 @@ usage: aella <command> [arg]
   down [-y]      terminate it — irreversible, deletes the box and its disk (-y skips the prompt)
 
   up and down run one at a time per machine: a second one exits at once (~/.aella-lock).
+  up launches in AELLA_REGION and remembers it: every later command follows the box there.
+  An AELLA_REGION that disagrees with the box's region is refused rather than guessed at.
 
 env overrides:
   AELLA_REGION   AWS region        (default $REGION)
@@ -426,6 +447,7 @@ UD
 }
 
 trap cleanup EXIT
+case "${1:-}" in ssh|tunnel|push|pull|ip|rdp|status) follow_box "$1" ;; esac   # down: under its lock
 case "${1:-}" in
   help|-h|--help) print_help ;;
   up)
@@ -446,12 +468,14 @@ case "${1:-}" in
     fi
     take_lock
     # refuse to orphan a box that's already up (it would keep billing untracked)
+    # (asked in the box's own region: a new AELLA_REGION would just not find it, and launch)
     if [ -s "$STATE" ]; then
-      st=$(aws ec2 describe-instances --instance-ids "$(cat "$STATE")" \
+      oldr=$(box_region); oldr="${oldr:-$REGION}"
+      st=$(aws_in "$oldr" ec2 describe-instances --instance-ids "$(cat "$STATE")" \
             --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || true)
       case "$st" in
         running|pending|stopping|stopped)
-          log "box $(cat "$STATE") already exists ($st) — 'aella down' it first, or 'aella ssh'"; exit 1 ;;
+          log "box $(cat "$STATE") already exists in $oldr ($st) — 'aella down' it first, or 'aella ssh'"; exit 1 ;;
       esac
     fi
     ensure_key
@@ -490,8 +514,9 @@ case "${1:-}" in
       --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":$DISK}}]" \
       --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=aella},{Key=aella-os,Value=$DISTRO}]" \
       --query 'Instances[0].InstanceId' --output text)
-    echo "$IID" > "$STATE"
     echo "$LOGIN" > "$USERSTATE"
+    echo "$REGION" > "$REGIONSTATE"
+    echo "$IID" > "$STATE"
     log "waiting for $IID to run ..."
     aws ec2 wait instance-running --instance-ids "$IID"
     IP=$(cur_ip)
@@ -528,18 +553,25 @@ case "${1:-}" in
           ip=$(cur_ip); scp -i "$PEM" -r "$(box_user)"@"$ip":"$src" "${3:-.}" ;;
   ip)     cur_ip ;;
   ls)
-    cur=$(cat "$STATE" 2>/dev/null || true)
-    rows=$(aws ec2 describe-instances \
-      --filters "Name=tag:Name,Values=aella" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
-      --query 'Reservations[].Instances[].[InstanceId,State.Name,InstanceType,PublicIpAddress,LaunchTime,Platform,Tags[?Key==`aella-os`]|[0].Value]' \
-      --output text 2>/dev/null || true)
-    [ -z "$rows" ] && { echo "no aella boxes"; exit 0; }
-    printf '%s\n' "$rows" | while IFS="$(printf '\t')" read -r iid state type ip launch plat os; do
-      mark=" "; [ "$iid" = "$cur" ] && mark="*"
-      # the aella-os tag names the distro; boxes from before the tag fall back to EC2's own platform
-      case "${os:-None}" in None) [ "$plat" = windows ] && os=windows || os=linux ;; esac
-      printf ' %s %-19s %-10s %-15s %-8s %-15s %s\n' "$mark" "$iid" "$state" "$type" "$os" "${ip:-—}" "$launch"
-    done ;;
+    # AELLA_REGION (or the default), plus wherever the current box lives if that's elsewhere
+    cur=$(cat "$STATE" 2>/dev/null || true); regions="$REGION"; r=$(box_region)
+    if [ -n "$cur" ] && [ -n "$r" ] && [ "$r" != "$REGION" ]; then regions="$REGION $r"; fi
+    found=
+    for r in $regions; do
+      rows=$(aws_in "$r" ec2 describe-instances \
+        --filters "Name=tag:Name,Values=aella" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+        --query 'Reservations[].Instances[].[InstanceId,State.Name,InstanceType,PublicIpAddress,LaunchTime,Platform,Tags[?Key==`aella-os`]|[0].Value]' \
+        --output text 2>/dev/null || true)
+      [ -n "$rows" ] || continue
+      found=1
+      printf '%s\n' "$rows" | while IFS="$(printf '\t')" read -r iid state type ip launch plat os; do
+        mark=" "; [ "$iid" = "$cur" ] && mark="*"
+        # the aella-os tag names the distro; boxes from before the tag fall back to EC2's own platform
+        case "${os:-None}" in None) [ "$plat" = windows ] && os=windows || os=linux ;; esac
+        printf ' %s %-19s %-10s %-15s %-8s %-14s %-15s %s\n' "$mark" "$iid" "$state" "$type" "$os" "$r" "${ip:-—}" "$launch"
+      done
+    done
+    [ -n "$found" ] || echo "no aella boxes" ;;
   rdp)
     if is_windows; then
       ip=$(cur_ip); ensure_win_sg >/dev/null
@@ -558,6 +590,7 @@ case "${1:-}" in
   down)
     take_lock
     IID=$(cat "$STATE" 2>/dev/null || true); [ -z "$IID" ] && { echo "no box"; exit 0; }
+    follow_box down
     if [ "${2:-}" != "-y" ] && [ "${2:-}" != "--yes" ]; then
       printf 'terminate %s? this deletes the box and its disk. [y/N] ' "$IID"
       read -r ans
@@ -565,6 +598,6 @@ case "${1:-}" in
     fi
     aws ec2 terminate-instances --instance-ids "$IID" \
       --query 'TerminatingInstances[0].[InstanceId,CurrentState.Name]' --output text
-    rm -f "$STATE" "$USERSTATE" ;;
+    rm -f "$STATE" "$USERSTATE" "$REGIONSTATE" ;;
   *) print_help >&2; exit 1 ;;
 esac

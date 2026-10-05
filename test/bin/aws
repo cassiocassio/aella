@@ -1,11 +1,11 @@
 #!/bin/bash
 # Minimal AWS CLI stand-in for aella's tests. Never touches AWS.
 # Behaviour is driven by FAKE_* env vars; every "service op" is appended to
-# $AELLA_TEST_LOG so tests can assert which calls happened.
-[ "$1" = --region ] && shift 2
+# $AELLA_TEST_LOG (with " @<region>" on the end) so tests can assert which calls happened, where.
+region=""; [ "$1" = --region ] && { region="$2"; shift 2; }
 svc="${1:-}"; op="${2:-}"
 all="$*"
-[ -n "${AELLA_TEST_LOG:-}" ] && echo "$svc $op :: $all" >> "$AELLA_TEST_LOG"
+[ -n "${AELLA_TEST_LOG:-}" ] && echo "$svc $op :: $all @$region" >> "$AELLA_TEST_LOG"
 case "$svc $op" in
   "sts get-caller-identity") echo '{"Account":"123456789012"}' ;;
   "ec2 describe-images")
@@ -37,7 +37,9 @@ case "$svc $op" in
      esac ;;
   "ec2 describe-instances")
      case "$all" in
-       *tag:Name*)        printf '%s\n' "${FAKE_LS_ROWS:-}" ;;
+       *tag:Name*)        # per-region rows: FAKE_LS_ROWS_eu_west_2 etc., else FAKE_LS_ROWS everywhere
+                          v="FAKE_LS_ROWS_$(printf '%s' "$region" | tr - _)"
+                          printf '%s\n' "${!v-${FAKE_LS_ROWS:-}}" ;;
        *PublicIpAddress*) echo "${FAKE_IP:-1.2.3.4}" ;;
        *State.Name*)      echo "${FAKE_STATE:-running}" ;;
        *)                 echo "" ;;

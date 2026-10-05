@@ -54,7 +54,8 @@ which is rare for its genre:
 ```sh
 aella down                                       # if a box is still running
 rm -rf ~/.aella ~/.local/bin/aella               # the tool (adjust to where you put it)
-rm -rf ~/.aella-instance ~/.aella-user ~/.aella-lock ~/.ssh/aella-key.pem   # its only local state + the key
+rm -rf ~/.aella-instance ~/.aella-user ~/.aella-region ~/.aella-lock   # its only local state
+rm -f  ~/.ssh/aella-key.pem                                             # ... and the key
 ```
 
 And on the AWS side, if you want it fully gone:
@@ -73,7 +74,7 @@ Key pairs and security groups are per-region: repeat with `--region` for any oth
 | command | what it does |
 |---|---|
 | `aella up [--latest] [--fedora \| --windows]` | launch a fresh box (Ubuntu LTS by default; `--latest` = newest release of the chosen distro; `--fedora` = Fedora instead; `--windows` = Windows Server 2025, [see below](#windows)), auto-provisions the shell, prints IP + ssh line |
-| `aella ls` | list **every** aella box from AWS tags (`*` = the current one) with its platform — the "what am I paying for?" view, works across machines and sessions |
+| `aella ls` | list **every** aella box from AWS tags (`*` = the current one) with its platform and region — the "what am I paying for?" view, works across machines and sessions. Looks in `AELLA_REGION` (or the default) and the current box's region |
 | `aella ssh` | ssh into the current box |
 | `aella tunnel [port]` | `ssh -N -L port:localhost:port` (default 8150) — run a web server on the box, open `http://localhost:port` on your machine |
 | `aella push <src> [dst]` | copy a local file/dir up to the box (remote dir auto-created; default is home) |
@@ -179,7 +180,7 @@ Override the defaults with env vars — handy for renting bigger or odd silicon:
 
 | var | default | |
 |---|---|---|
-| `AELLA_REGION` | `eu-north-1` | AWS region |
+| `AELLA_REGION` | `eu-north-1` | AWS region `up` launches in (later commands follow the box; see below) |
 | `AELLA_TYPE` | `m7i-flex.large` | instance type (amd64, 8 GB — **not** free tier) |
 | `AELLA_DISTRO` | `ubuntu` | `ubuntu`, `fedora` or `windows` (per-run: `up --fedora` / `up --windows`) |
 | `AELLA_FEDORA` | `42` | Fedora release to launch |
@@ -191,9 +192,15 @@ Override the defaults with env vars — handy for renting bigger or odd silicon:
 AELLA_TYPE=c7g.8xlarge AELLA_REGION=us-east-1 aella up   # a big Graviton box
 ```
 
-`ls`, `ssh`, `down` and the rest look in `AELLA_REGION` too. If you move region, set it in
-your shell profile rather than per command, or `down` won't find the box. On the first `up`
-in a new region, aella imports your existing key pair there.
+`up` launches in `AELLA_REGION` and records it in `~/.aella-region`. Every later command
+about that box (`ssh`, `tunnel`, `push`, `pull`, `ip`, `rdp`, `status`, `down`) goes to the
+recorded region, so a one-off `AELLA_REGION=us-east-1 aella up` is followed by a plain
+`aella down`. If `AELLA_REGION` is set *and disagrees* with the box's region, aella refuses
+and tells you the region to use, rather than guessing which you meant. `ls` lists
+`AELLA_REGION` (or the default) plus the current box's region, with a region column; boxes
+in any other region need `AELLA_REGION=<there> aella ls`. A box launched before
+`~/.aella-region` existed has no record, so it uses `AELLA_REGION` / the default as before.
+On the first `up` in a new region, aella imports your existing key pair there.
 
 ## Notes
 
@@ -204,9 +211,10 @@ in a new region, aella imports your existing key pair there.
 - **This costs money.** The default instance type is not free-tier and bills per second while
   running. `aella down` is what stops the meter. Spot pricing + a bigger `AELLA_TYPE` makes a
   good cheap-but-fast combo.
-- State lives in `~/.aella-instance` (the current instance id) and `~/.aella-user` (its login
-  name, since Ubuntu, Fedora and Windows images differ; `Administrator` marks a Windows box). Nothing else is stored. A box launched before
-  `~/.aella-user` existed is assumed to be Ubuntu.
+- State lives in `~/.aella-instance` (the current instance id), `~/.aella-user` (its login
+  name, since Ubuntu, Fedora and Windows images differ; `Administrator` marks a Windows box)
+  and `~/.aella-region` (where it was launched). Nothing else is stored; `down` clears all
+  three. A box launched before `~/.aella-user` existed is assumed to be Ubuntu.
 - **One `up`/`down` at a time.** Two sessions launching at once could each start a box and
   only one would be tracked, the other billing unseen. So `up` and `down` hold a lock
   (`~/.aella-lock`, a directory holding the owner's pid) and a second one fails straight
@@ -225,8 +233,9 @@ in a new region, aella imports your existing key pair there.
 
 `bash test/aella.test.sh` — unit tests that mock the AWS CLI (`test/bin/aws`), so they
 never touch AWS or spend a cent. They pin the parts where a regression would cost money or
-lock you out: the orphan-billing guard, the one-`up`/`down`-at-a-time lock (including a
-real concurrent pair, and stale-lock recovery), the `down` confirmation, the no-empty-host ssh guard,
+lock you out: the orphan-billing guard (also across regions), the one-`up`/`down`-at-a-time
+lock (including a real concurrent pair, and stale-lock recovery), that every command follows
+the box's recorded region and refuses a conflicting `AELLA_REGION`, the `down` confirmation, the no-empty-host ssh guard,
 the user-data heredocs, and — for Fedora — that the release picker skips the Rawhide/ELN
 decoys and that every `ssh`/`push`/`pull` follows the box's real login name — and for
 Windows that RDP/SSH ingress is your `/32` only and never touches `aella-sg`, that the

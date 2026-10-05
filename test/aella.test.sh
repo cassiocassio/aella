@@ -17,7 +17,7 @@ sandbox() {
   : > "$AELLA_TEST_LOG"
   unset FAKE_STATE FAKE_IP FAKE_LS_ROWS FAKE_IID FAKE_AMI FAKE_MYIP FAKE_PW FAKE_SSM FAKE_SG_CIDRS \
         FAKE_PBCOPY_FAIL FAKE_OPEN_FAIL FAKE_PW_ERR FAKE_KEYGEN_FAIL FAKE_NO_KEYPAIR FAKE_WAIT_SECS \
-        AELLA_PW_TIMEOUT AELLA_DISK AELLA_TYPE
+        AELLA_PW_TIMEOUT AELLA_DISK AELLA_TYPE AELLA_REGION
 }
 aella() { env PATH="$DIR/bin:$PATH" bash "$AELLA" "$@"; }
 called() { grep -q "$1" "$AELLA_TEST_LOG"; }
@@ -128,6 +128,63 @@ mkdir "$HOME/.aella-lock"; echo $$ > "$HOME/.aella-lock/pid"
 aella ssh >/dev/null 2>&1; rc=$?
 { [ $rc -eq 0 ] && called "ssh .*ubuntu@9.9.9.9"; } && pass "lock: only up/down take it — ssh works during an up" || fail "ssh blocked by lock"
 unset FAKE_IP
+
+# --- region: recorded at up, followed afterwards ---------------------------
+sandbox; export AELLA_REGION=eu-west-2
+aella up >/dev/null 2>&1; unset AELLA_REGION
+{ called "run-instances .*@eu-west-2$" && [ "$(cat "$HOME/.aella-region" 2>/dev/null)" = eu-west-2 ]; } \
+  && pass "up: launches in AELLA_REGION and records it" || fail "region record" "$(cat "$AELLA_TEST_LOG")"
+sandbox; aella up >/dev/null 2>&1
+[ "$(cat "$HOME/.aella-region" 2>/dev/null)" = eu-north-1 ] && pass "up: records the default region too" || fail "default region record"
+
+sandbox; echo i-abc > "$HOME/.aella-instance"; echo eu-west-2 > "$HOME/.aella-region"; export FAKE_IP=9.9.9.9
+aella ssh >/dev/null 2>&1; aella ip >/dev/null 2>&1; aella status >/dev/null 2>&1
+aella push "$HOME/.aella-region" x >/dev/null 2>&1; aella pull y >/dev/null 2>&1; aella tunnel >/dev/null 2>&1
+aella rdp >/dev/null 2>&1
+{ called "ssh .*ubuntu@9.9.9.9" && ! grep -v '@eu-west-2$' "$AELLA_TEST_LOG" | grep -q '^ec2 '; } \
+  && pass "ssh/ip/status/push/pull/tunnel/rdp: every AWS call goes to the box's recorded region" \
+  || fail "follow region" "$(cat "$AELLA_TEST_LOG")"
+aella down -y >/dev/null 2>&1
+{ called "terminate-instances .*@eu-west-2$" && [ ! -e "$HOME/.aella-region" ] && [ ! -e "$HOME/.aella-instance" ]; } \
+  && pass "down (no AELLA_REGION): terminates in the recorded region, clears the region record" \
+  || fail "down region" "$(cat "$AELLA_TEST_LOG")"
+unset FAKE_IP
+
+sandbox; echo i-abc > "$HOME/.aella-instance"; echo eu-west-2 > "$HOME/.aella-region"; export AELLA_REGION=us-east-1
+out=$(aella ssh 2>&1); rc=$?
+out2=$(aella down -y 2>&1); rc2=$?
+{ [ $rc -eq 1 ] && [ $rc2 -eq 1 ] && ! called "^ssh " && ! called terminate-instances \
+    && echo "$out" | grep -q "is in eu-west-2, but AELLA_REGION=us-east-1" && echo "$out2" | grep -q "AELLA_REGION=eu-west-2 aella down" \
+    && [ -s "$HOME/.aella-instance" ] && [ ! -e "$HOME/.aella-lock" ]; } \
+  && pass "AELLA_REGION disagrees with the box's region: refuses (ssh, down), keeps state, says how" \
+  || fail "region conflict" "rc=$rc rc2=$rc2 $out $out2"
+export AELLA_REGION=eu-west-2
+aella down -y >/dev/null 2>&1
+called "terminate-instances .*@eu-west-2$" && pass "AELLA_REGION agreeing with the box: fine" || fail "region agree"
+unset AELLA_REGION
+
+sandbox; echo i-old > "$HOME/.aella-instance"; export AELLA_REGION=eu-west-2
+aella down -y >/dev/null 2>&1; unset AELLA_REGION
+called "terminate-instances .*@eu-west-2$" && pass "box tracked before regions were recorded: AELLA_REGION still applies" || fail "legacy region"
+sandbox; echo i-old > "$HOME/.aella-instance"
+aella down -y >/dev/null 2>&1
+called "terminate-instances .*@eu-north-1$" && pass "...and with no AELLA_REGION, the default" || fail "legacy default region"
+
+sandbox; echo i-running > "$HOME/.aella-instance"; echo eu-west-2 > "$HOME/.aella-region"; export FAKE_STATE=running
+out=$(aella up 2>&1); rc=$?
+{ [ $rc -eq 1 ] && ! called run-instances && called "describe-instances .*i-running.*@eu-west-2$" \
+    && echo "$out" | grep -q "already exists in eu-west-2"; } \
+  && pass "up in another region while the tracked box runs: the orphan guard still finds it" \
+  || fail "cross-region orphan guard" "rc=$rc $out $(cat "$AELLA_TEST_LOG")"
+unset FAKE_STATE
+
+sandbox; echo i-there > "$HOME/.aella-instance"; echo eu-west-2 > "$HOME/.aella-region"
+export FAKE_LS_ROWS_eu_north_1="$(printf 'i-here\trunning\tm7i-flex.large\t1.2.3.4\t2026-10-05\tNone\tubuntu')"
+export FAKE_LS_ROWS_eu_west_2="$(printf 'i-there\trunning\tm7i-flex.large\t5.6.7.8\t2026-10-05\tNone\tfedora')"
+out=$(aella ls)
+{ echo "$out" | grep -q '^   i-here .* eu-north-1 ' && echo "$out" | grep -q '^ \* i-there .* eu-west-2 '; } \
+  && pass "ls: covers AELLA_REGION/default and the current box's region, with a region column" || fail "ls regions" "$out"
+unset FAKE_LS_ROWS_eu_north_1 FAKE_LS_ROWS_eu_west_2
 
 # --- cur_ip guard: no ssh to an empty host --------------------------------
 sandbox; echo i-abc > "$HOME/.aella-instance"; export FAKE_IP=None
