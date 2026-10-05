@@ -153,9 +153,13 @@ aella down               # stop the meter (the licence is billed with the instan
   `aws ec2 get-console-output --instance-id <id> --latest`. So `ssh`,
   `tunnel`, `push` and `pull` work too; remote paths are relative to
   `C:\Users\Administrator`. sshd was up within seconds of the password in testing.
+  A recent OpenSSH client (10.1+) warns that the connection "is not using a post-quantum
+  key exchange algorithm": Windows ships an older sshd. It's a notice, not an error, and
+  the connection works.
 - **Disk:** 60 GB by default. 30 GB is the image's own size and the floor (`AELLA_DISK`
   can't go below it), but it's tight: after Python, a pipx-installed app (~560 MB venv)
-  and a 1.5 GB Whisper model, only ~2 GB was left.
+  and a 1.5 GB Whisper model, only ~2 GB was left. Windows grows `C:` to fill the disk
+  (59.5 GB usable on 60). A clean Server 2025 install plus those tools used about 24 GB.
 - **Cost.** The Windows licence is billed per second on top of the instance, and only while
   the box exists. On-demand, Oct 2026, licence included:
 
@@ -260,6 +264,8 @@ They pin the parts where a regression would cost money or lock you out:
 - **Linux:** the no-empty-host ssh guard, the user-data heredocs, the Fedora release
   picker skipping the Rawhide/ELN decoys, and `ssh`/`push`/`pull` following the box's real
   login name.
+- **Host keys:** every `ssh`/`tunnel`/`push`/`pull` uses aella's own known-hosts file with
+  `accept-new`. `up` and `down` reset that file, and `~/.ssh/known_hosts` is never touched.
 - **Windows:** RDP/SSH ingress is `/32`s you came from, pruned to the newest 3 (or just
   this one with `--only-here`), never `0.0.0.0/0`, never touching `aella-sg`, and a failed
   IP lookup adds and revokes nothing. The password reaches the clipboard (or a 0600 file)
@@ -267,6 +273,35 @@ They pin the parts where a regression would cost money or lock you out:
   broken out of. And the timeout, no-SSM and no-AMI failure paths.
 
 Not an end-to-end test — for that, do one real `up`/`down` cycle.
+
+**Last live run: 5 Oct 2026, eu-north-1, `m7i-flex.large`.** All of these passed against
+real AWS:
+
+- **Lock:** a second `up`, and a `down`, run while an Ubuntu `up` was launching both
+  stopped at once and named its pid. The first `up` finished normally.
+- **Region:** `up` recorded `eu-north-1`. `AELLA_REGION=us-east-1 aella status` refused
+  and named the right region, and `AELLA_REGION=eu-north-1` was accepted.
+- **Host keys and transfer:** `push` and `pull` ran from a shell with no terminal, on
+  first contact, to both the Ubuntu box and a Windows Server 2025 box. The file came back
+  byte-identical, and the box's key landed in `~/.ssh/aella_known_hosts`.
+- **`ls`:** listed both boxes with the region column, marking only the tracked one.
+- **`down`:** cleared all three state files and the known-hosts file. AWS reported the
+  box `terminated`.
+- **Windows disk:** `C:` was 59.5 GB on the 60 GB default.
+- **`aella-win-sg` pruning** (decoys from the reserved documentation ranges, on both 22
+  and 3389):
+  - `rdp --only-here` removed a timestamped decoy and kept the current IP.
+  - Plain `rdp` with three timestamped decoys and one untimestamped one kept the current
+    IP and the two newest decoys. It removed the oldest and the untimestamped one.
+  - Each run refreshed the current IP's timestamp in place, with no duplicate rule.
+
+Not covered live: the 60 GB default on a fresh `up --windows` (the disk was checked on a
+box launched with `AELLA_DISK=60`), and a crashed run's stale lock (the unit tests cover it).
+
+To run a live cycle without disturbing a box you already have, give it a throwaway `HOME`.
+Copy `~/.ssh/aella-key.pem` into it, and point `AWS_CONFIG_FILE` and
+`AWS_SHARED_CREDENTIALS_FILE` at your real ones. aella's state files and lock then live
+in that `HOME`, separate from your real ones.
 
 ## Licence
 
