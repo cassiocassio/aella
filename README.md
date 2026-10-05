@@ -80,7 +80,7 @@ Key pairs and security groups are per-region: repeat with `--region` for any oth
 | `aella push <src> [dst]` | copy a local file/dir up to the box (remote dir auto-created; default is home) |
 | `aella pull <src> [dst]` | copy a file/dir from the box back down (default: current dir) |
 | `aella ip` | print the current public IP (clean stdout, script-friendly) |
-| `aella rdp` | **Windows box:** copy the Administrator password to your clipboard and open a Remote Desktop session (re-allows your current IP first). **Linux box:** re-allow RDP (3389) from your *current* IP, for a GUI desktop you've set up yourself — run again after you roam |
+| `aella rdp [--only-here]` | **Windows box:** copy the Administrator password to your clipboard and open a Remote Desktop session (adds your current IP first; the group keeps your 3 most recent, `--only-here` drops all but this one — [see below](#windows)). **Linux box:** re-allow RDP (3389) from your *current* IP, for a GUI desktop you've set up yourself — run again after you roam |
 | `aella status` | show the current box |
 | `aella down [-y]` | **terminate** it — irreversible, deletes the box and its disk (`-y` skips the prompt) |
 | `aella help` | this |
@@ -135,10 +135,15 @@ aella down               # stop the meter (the licence is billed with the instan
   Remote Desktop). If nothing handles `.rdp` files, it tells you so. On Linux it tries
   `xdg-open`, else suggests `xfreerdp /v:IP /u:Administrator`.
 - **Network.** Windows boxes get their own security group, `aella-win-sg`, with RDP (3389)
-  and SSH (22) open **only to your current public IP**. Every `up --windows` and `aella
-  rdp` adds your current IP and revokes the old ones, so the group never trusts an address
-  you've left. The flip side: using it from two networks at once means re-running `aella
-  rdp` on whichever one you switch to. `aella-sg` (Linux) is untouched.
+  and SSH (22) open **only to your own recent public IPs** (each a `/32`; never
+  `0.0.0.0/0`). Every `up --windows` and `aella rdp` adds your current IP, stamped
+  `aella <UTC time>` in the rule's description (an IP already there is re-stamped), then
+  keeps the **3 most recently stamped** and revokes the rest, along with anything aella
+  didn't stamp (rules from older aella versions, or a range added by hand). So home, office
+  and a hotspot can all stay connected, and the group never holds more than 3 addresses.
+  `AELLA_WIN_IPS` changes the 3; `aella rdp --only-here` keeps just the IP you're on now. If
+  your public IP can't be determined, no rule is added and none is revoked. `aella-sg`
+  (Linux) is untouched.
 - **SSH.** First-boot user-data (PowerShell, via EC2Launch) enables the OpenSSH server
   that ships with Server 2025. It authorises the aella **public** key for Administrator in
   `C:\ProgramData\ssh\administrators_authorized_keys` (ACL: Administrators + SYSTEM
@@ -187,6 +192,7 @@ Override the defaults with env vars — handy for renting bigger or odd silicon:
 | `AELLA_DISK` | `20` | root disk, GB (Windows: `60`; `30` minimum) |
 | `AELLA_LTS` | `24.04` | which LTS `up` uses by default |
 | `AELLA_PW_TIMEOUT` | `900` | seconds to wait for a Windows box's password |
+| `AELLA_WIN_IPS` | `3` | how many of your most recent IPs `aella-win-sg` keeps open |
 
 ```sh
 AELLA_TYPE=c7g.8xlarge AELLA_REGION=us-east-1 aella up   # a big Graviton box
@@ -207,7 +213,7 @@ On the first `up` in a new region, aella imports your existing key pair there.
 - **SSH on Linux boxes is open to `0.0.0.0/0`** but **key-only** (password auth off on both
   Ubuntu and Fedora cloud AMIs). The key pair is created on first `up` and saved to
   `~/.ssh/aella-key.pem`. RDP, if you use it, is scoped to your current IP only. Windows
-  boxes are stricter: both RDP and SSH are open to your current IP only.
+  boxes are stricter: both RDP and SSH are open only to your few most recent IPs.
 - **This costs money.** The default instance type is not free-tier and bills per second while
   running. `aella down` is what stops the meter. Spot pricing + a bigger `AELLA_TYPE` makes a
   good cheap-but-fast combo.
@@ -231,17 +237,25 @@ On the first `up` in a new region, aella imports your existing key pair there.
 
 ## Tests
 
-`bash test/aella.test.sh` — unit tests that mock the AWS CLI (`test/bin/aws`), so they
-never touch AWS or spend a cent. They pin the parts where a regression would cost money or
-lock you out: the orphan-billing guard (also across regions), the one-`up`/`down`-at-a-time
-lock (including a real concurrent pair, and stale-lock recovery), that every command follows
-the box's recorded region and refuses a conflicting `AELLA_REGION`, the `down` confirmation, the no-empty-host ssh guard,
-the user-data heredocs, and — for Fedora — that the release picker skips the Rawhide/ELN
-decoys and that every `ssh`/`push`/`pull` follows the box's real login name — and for
-Windows that RDP/SSH ingress is your `/32` only and never touches `aella-sg`, that the
-password reaches the clipboard (or a 0600 file) but never the terminal, the `.rdp` file or
-any command line, that the user-data can't be broken out of, and the timeout, no-SSM and
-no-AMI failure paths. Not an end-to-end test — for that, do one real `up`/`down` cycle.
+`bash test/aella.test.sh` (and `/bin/bash test/aella.test.sh` on a Mac, for bash 3.2) —
+unit tests that mock the AWS CLI (`test/bin/aws`), so they never touch AWS or spend a cent.
+They pin the parts where a regression would cost money or lock you out:
+
+- **Billing:** the orphan guard (also across regions), the one-`up`/`down`-at-a-time lock
+  (a real concurrent pair, stale-lock recovery, release on refusal and on kill), and the
+  `down` confirmation.
+- **Regions:** every command follows the box's recorded region, a conflicting
+  `AELLA_REGION` is refused, and boxes from before the record still work.
+- **Linux:** the no-empty-host ssh guard, the user-data heredocs, the Fedora release
+  picker skipping the Rawhide/ELN decoys, and `ssh`/`push`/`pull` following the box's real
+  login name.
+- **Windows:** RDP/SSH ingress is `/32`s you came from, pruned to the newest 3 (or just
+  this one with `--only-here`), never `0.0.0.0/0`, never touching `aella-sg`, and a failed
+  IP lookup adds and revokes nothing. The password reaches the clipboard (or a 0600 file)
+  but never the terminal, the `.rdp` file or any command line. The user-data can't be
+  broken out of. And the timeout, no-SSM and no-AMI failure paths.
+
+Not an end-to-end test — for that, do one real `up`/`down` cycle.
 
 ## Licence
 

@@ -13,7 +13,8 @@ DISTRO="${AELLA_DISTRO:-ubuntu}"         # ubuntu | fedora | windows; `up --fedo
 FEDORA="${AELLA_FEDORA:-42}"             # default Fedora release; `up --fedora --latest` picks the newest
 KEY=aella-key
 SG=aella-sg
-WIN_SG=aella-win-sg                      # Windows gets its own group: RDP + SSH from your IP only
+WIN_SG=aella-win-sg                      # Windows gets its own group: RDP + SSH from your recent IPs only
+WIN_KEEP="${AELLA_WIN_IPS:-3}"           # how many of your most recent IPs aella-win-sg keeps
 WIN_AMI_PARAM=/aws/service/ami-windows-latest/Windows_Server-2025-English-Full-Base
 PW_TIMEOUT="${AELLA_PW_TIMEOUT:-900}"    # seconds to wait for Windows to post its password (1-4 min typical)
 PW_POLL="${AELLA_PW_POLL:-15}"
@@ -71,8 +72,10 @@ usage: aella <command> [arg]
   push <src> [d] copy a local file/dir up to the box (remote dir d auto-created; default home)
   pull <src> [d] copy a file/dir from the box back down (default: here)
   ip             print the current public IP
-  rdp            Windows box: password to clipboard + open a Remote Desktop session
-                 (also re-allows your current IP). Linux box: re-allow RDP (3389) from your IP
+  rdp [--only-here]
+                 Windows box: password to clipboard + open a Remote Desktop session (also
+                 adds your current IP; the group keeps your $WIN_KEEP most recent, --only-here
+                 drops all but this one). Linux box: re-allow RDP (3389) from your IP
   status         show the current box
   down [-y]      terminate it — irreversible, deletes the box and its disk (-y skips the prompt)
 
@@ -88,6 +91,7 @@ env overrides:
   AELLA_DISTRO   ubuntu | fedora | windows   (default $DISTRO)
   AELLA_FEDORA   Fedora release    (default $FEDORA)
   AELLA_PW_TIMEOUT  seconds to wait for the Windows password (default $PW_TIMEOUT)
+  AELLA_WIN_IPS  how many recent IPs the Windows group keeps (default $WIN_KEEP)
 
 cost: every box bills per second while it exists (down stops it). Windows adds a
   licence to the hourly rate: m7i-flex.large is ~\$0.18-0.20/hr all-in (eu-north-1
@@ -213,25 +217,44 @@ my_ip() {  # your public IPv4 — validated, so a failed lookup can never become
   echo "$ip"
 }
 
-ensure_win_sg() {  # Windows-only group: RDP + SSH from your CURRENT IP only; prints the id
-  # A separate group, so Windows never widens aella-sg (whose SSH is 0.0.0.0/0, key-only on Linux).
-  local id ip port old
+ensure_win_sg() {  # $1 = how many recent IPs to keep (default $WIN_KEEP). Prints the group id.
+  # Windows-only group: RDP + SSH from your most recent IPs, never 0.0.0.0/0. A separate
+  # group, so Windows never widens aella-sg (whose SSH is 0.0.0.0/0, key-only on Linux).
+  local keep="${1:-$WIN_KEEP}" id ip port now perm old
+  case "$keep" in ""|*[!0-9]*) keep=0 ;; *) keep=$((10#$keep)) ;; esac   # 10#: "08" isn't octal
+  [ "$keep" -ge 1 ] || { log "AELLA_WIN_IPS must be a whole number >= 1 (got '${1:-$WIN_KEEP}')"; exit 1; }
   ip=$(my_ip) || exit 1
   id=$(aws ec2 describe-security-groups --group-names "$WIN_SG" --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || true)
   if [ -z "$id" ] || [ "$id" = None ]; then
-    log "creating security group $WIN_SG (RDP + SSH from your IP only)"
-    id=$(aws ec2 create-security-group --group-name "$WIN_SG" --description "aella Windows box: RDP+SSH from one IP" --query GroupId --output text)
+    log "creating security group $WIN_SG (RDP + SSH from your recent IPs only)"
+    id=$(aws ec2 create-security-group --group-name "$WIN_SG" --description "aella Windows box: RDP+SSH from your recent IPs" --query GroupId --output text)
   fi
+  # Each rule is stamped "aella <UTC time>" when added (or seen again), which is how the
+  # newest are told apart from the IPs you've roamed away from.
+  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   for port in 3389 22; do
-    aws ec2 authorize-security-group-ingress --group-id "$id" --protocol tcp --port "$port" --cidr "$ip/32" >/dev/null 2>&1 || true
-    # revoke the IPs you've since roamed away from, so the group only ever trusts where you are now
+    perm="[{\"IpProtocol\":\"tcp\",\"FromPort\":$port,\"ToPort\":$port,\"IpRanges\":[{\"CidrIp\":\"$ip/32\",\"Description\":\"aella $now\"}]}]"
+    aws ec2 authorize-security-group-ingress --group-id "$id" --ip-permissions "$perm" >/dev/null 2>&1 \
+      || aws ec2 update-security-group-rule-descriptions-ingress --group-id "$id" --ip-permissions "$perm" >/dev/null 2>&1 \
+      || true
+    # Keep this IP plus the keep-1 most recently stamped /32s; revoke the rest, including
+    # anything aella didn't stamp (a rule from an older aella, or a hand-added wider range).
     for old in $(aws ec2 describe-security-groups --group-ids "$id" \
-                   --query "SecurityGroups[0].IpPermissions[?ToPort==\`$port\`].IpRanges[].CidrIp" --output text 2>/dev/null || true); do
-      [ "$old" = "$ip/32" ] || [ "$old" = None ] || \
-        aws ec2 revoke-security-group-ingress --group-id "$id" --protocol tcp --port "$port" --cidr "$old" >/dev/null 2>&1 || true
+                   --query "SecurityGroups[0].IpPermissions[?ToPort==\`$port\`].IpRanges[].[CidrIp,Description]" \
+                   --output text 2>/dev/null \
+                 | awk -F'\t' -v cur="$ip/32" '
+                     $1 == "" || $1 == "None" || $1 == cur { next }
+                     $1 ~ /^[0-9.]+\/32$/ && $2 ~ /^aella [0-9]/ { print $2 "\t" $1; next }
+                     { print "-\t" $1 }' \
+                 | LC_ALL=C sort -r \
+                 | awk -F'\t' -v keep="$((keep - 1))" '$1 == "-" || ++n > keep { print $2 }'); do
+      if aws ec2 revoke-security-group-ingress --group-id "$id" --protocol tcp --port "$port" --cidr "$old" >/dev/null 2>&1; then
+        log "  port $port: revoked $old"
+      fi
     done
   done
-  log "RDP (3389) + SSH (22) allowed from $ip only"
+  if [ "$keep" -eq 1 ]; then log "RDP (3389) + SSH (22) allowed from $ip only"
+  else log "RDP (3389) + SSH (22) allowed from $ip (plus up to $((keep - 1)) of your other recent IPs)"; fi
   echo "$id"
 }
 
@@ -573,13 +596,15 @@ case "${1:-}" in
     done
     [ -n "$found" ] || echo "no aella boxes" ;;
   rdp)
+    keep=""; [ "${2:-}" = --only-here ] && keep=1
     if is_windows; then
-      ip=$(cur_ip); ensure_win_sg >/dev/null
+      ip=$(cur_ip); ensure_win_sg ${keep:+"$keep"} >/dev/null
       PW=$(wait_password "$(cat "$STATE")") || { log "Windows hasn't posted its password yet — try again in a minute"; exit 1; }
       deliver_password "$PW"; PW=""
       open_rdp "$ip" || exit 1
       echo "connect to $ip:3389 as Administrator"
     else
+      [ -z "$keep" ] || log "(--only-here is for Windows boxes; aella-sg is left as it is)"
       SGID=$(sg_id); [ -n "$SGID" ] && [ "$SGID" != None ] || { log "no security group"; exit 1; }
       add_rdp "$SGID"; ip=$(cur_ip); echo "connect an RDP client to $ip:3389"
     fi ;;

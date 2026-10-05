@@ -53,7 +53,9 @@ case "$svc $op" in
        *)               echo "sg-123" ;;
      esac ;;
   "ec2 create-security-group")             echo "sg-123" ;;
-  "ec2 authorize-security-group-ingress")  : ;;
+  "ec2 authorize-security-group-ingress")
+     [ -n "${FAKE_SG_DUP:-}" ] && { echo "An error occurred (InvalidPermission.Duplicate)" >&2; exit 254; }
+     : ;;
   "ec2 create-key-pair")                   echo "FAKE-KEY-MATERIAL" ;;
   *) : ;;
 esac

@@ -16,12 +16,15 @@ sandbox() {
   export HOME="$SB" TMPDIR="$SB" AELLA_TEST_LOG="$SB/calls.log" AELLA_PW_POLL=0
   : > "$AELLA_TEST_LOG"
   unset FAKE_STATE FAKE_IP FAKE_LS_ROWS FAKE_IID FAKE_AMI FAKE_MYIP FAKE_PW FAKE_SSM FAKE_SG_CIDRS \
-        FAKE_PBCOPY_FAIL FAKE_OPEN_FAIL FAKE_PW_ERR FAKE_KEYGEN_FAIL FAKE_NO_KEYPAIR FAKE_WAIT_SECS \
+        FAKE_PBCOPY_FAIL FAKE_OPEN_FAIL FAKE_PW_ERR FAKE_KEYGEN_FAIL FAKE_NO_KEYPAIR FAKE_WAIT_SECS FAKE_SG_DUP AELLA_WIN_IPS \
         AELLA_PW_TIMEOUT AELLA_DISK AELLA_TYPE AELLA_REGION
 }
 aella() { env PATH="$DIR/bin:$PATH" bash "$AELLA" "$@"; }
 called() { grep -q "$1" "$AELLA_TEST_LOG"; }
 ncalls() { grep -c "$1" "$AELLA_TEST_LOG"; }
+calledF() { grep -qF -- "$1" "$AELLA_TEST_LOG"; }   # fixed string: for JSON arguments
+# the stamped ingress rule aella-win-sg gets for your IP on a port ($1)
+win_rule() { printf '"FromPort":%s,"ToPort":%s,"IpRanges":[{"CidrIp":"203.0.113.7/32","Description":"aella 20' "$1" "$1"; }
 
 echo "TEST: aella (mocked AWS — no real calls)"
 echo
@@ -307,10 +310,9 @@ out=$(aella up --windows 2>&1); rc=$?
     && [ "$(cat "$HOME/.aella-user" 2>/dev/null)" = Administrator ]; } \
   && pass "up --windows: SSM AMI, m7i-flex.large, 60 GB, tagged, records Administrator" \
   || fail "up --windows" "rc=$rc $out $(cat "$AELLA_TEST_LOG")"
-{ called "authorize-security-group-ingress .*--port 3389 --cidr 203.0.113.7/32" \
-    && called "authorize-security-group-ingress .*--port 22 --cidr 203.0.113.7/32" \
+{ calledF "$(win_rule 3389)" && calledF "$(win_rule 22)" \
     && ! called "authorize.*0.0.0.0/0" && ! called "group-names aella-sg "; } \
-  && pass "up --windows: RDP + SSH from your /32 only, via aella-win-sg (aella-sg untouched)" \
+  && pass "up --windows: RDP + SSH from your /32 only (stamped 'aella <time>'), via aella-win-sg (aella-sg untouched)" \
   || fail "windows ingress scope" "$(cat "$AELLA_TEST_LOG")"
 { [ "$(cat "$HOME/clipboard" 2>/dev/null)" = "$PW" ] && ! echo "$out" | grep -qF "$PW" \
     && ! grep -qF "$PW" "$AELLA_TEST_LOG" && echo "$out" | grep -q clipboard; } \
@@ -346,8 +348,8 @@ out=$(aella up --windows 2>&1); rc=$?
 
 sandbox; export FAKE_MYIP=""
 out=$(aella up --windows 2>&1); rc=$?
-{ [ $rc -eq 1 ] && ! called "run-instances" && ! called "authorize-security-group-ingress"; } \
-  && pass "public-IP lookup fails: no '/32' rule, launches nothing" || fail "my_ip guard" "rc=$rc $out"
+{ [ $rc -eq 1 ] && ! called "run-instances" && ! called "authorize-security-group-ingress" && ! called "revoke-security-group-ingress"; } \
+  && pass "public-IP lookup fails: no '/32' rule, nothing revoked, launches nothing" || fail "my_ip guard" "rc=$rc $out"
 
 sandbox; export AELLA_PW_TIMEOUT=0 FAKE_PW_ERR=1
 out=$(aella up --windows 2>&1); rc=$?
@@ -383,7 +385,7 @@ ud=$(gen_wud "ssh-rsa AAAA'; Remove-Item C:\\ -Recurse; '"); rc=$?
 
 # --- windows: rdp -------------------------------------------------------------
 sandbox; echo i-win > "$HOME/.aella-instance"; echo Administrator > "$HOME/.aella-user"
-export FAKE_IP=9.9.9.9 FAKE_PW="$PW" FAKE_SG_CIDRS="$(printf '198.51.100.9/32\t203.0.113.7/32')"
+export FAKE_IP=9.9.9.9 FAKE_PW="$PW" FAKE_SG_CIDRS="$(printf '198.51.100.9/32\tNone\n203.0.113.7/32\tNone')"
 out=$(aella rdp 2>&1); rc=$?
 rdpf=$(sed -n 's/^open //p' "$AELLA_TEST_LOG" | head -1)
 { [ $rc -eq 0 ] && [ -n "$rdpf" ] && grep -q '^full address:s:9.9.9.9:3389' "$rdpf" \
@@ -393,9 +395,72 @@ rdpf=$(sed -n 's/^open //p' "$AELLA_TEST_LOG" | head -1)
   || fail "rdp windows" "rc=$rc $out $(cat "$AELLA_TEST_LOG")"
 { [ "$(cat "$HOME/clipboard" 2>/dev/null)" = "$PW" ] && ! echo "$out" | grep -qF "$PW" && ! grep -qF "$PW" "$rdpf"; } \
   && pass "rdp (windows): password to clipboard only — not printed, not in the .rdp" || fail "rdp password" "$out"
-{ called "revoke-security-group-ingress .*--cidr 198.51.100.9/32" && ! called "revoke.*203.0.113.7"; } \
-  && pass "rdp (windows): re-allows your current IP and revokes the one you roamed from" \
+{ calledF "$(win_rule 3389)" && called "revoke-security-group-ingress .*--cidr 198.51.100.9/32" && ! called "revoke.*203.0.113.7"; } \
+  && pass "rdp (windows): re-allows your current IP; an unstamped rule (older aella) is revoked" \
   || fail "rdp roaming" "$(cat "$AELLA_TEST_LOG")"
+
+# aella-win-sg as several networks leave it: you (stamped earlier), three other stamped IPs,
+# an unstamped legacy /32, a wide range someone added by hand, and a stamped non-/32
+SG_ROWS="$(printf '%s\t%s\n' \
+  203.0.113.7/32 'aella 2026-09-01T08:00:00Z' \
+  198.51.100.1/32 'aella 2026-10-04T09:00:00Z' \
+  198.51.100.2/32 'aella 2026-10-03T09:00:00Z' \
+  198.51.100.3/32 'aella 2026-09-20T09:00:00Z' \
+  192.0.2.4/32 None \
+  0.0.0.0/0 None \
+  10.0.0.0/8 'aella 2026-10-05T09:00:00Z')"
+revoked() { for c in "$@"; do [ "$(ncalls "revoke-security-group-ingress .*--cidr $c ")" -eq 2 ] || return 1; done; }
+kept() { for c in "$@"; do ! called "revoke-security-group-ingress .*--cidr $c " || return 1; done; }
+
+sandbox; echo i-win > "$HOME/.aella-instance"; echo Administrator > "$HOME/.aella-user"
+export FAKE_PW="$PW" FAKE_SG_CIDRS="$SG_ROWS"
+out=$(aella rdp 2>&1)
+{ kept 203.0.113.7/32 198.51.100.1/32 198.51.100.2/32 && revoked 198.51.100.3/32 192.0.2.4/32 0.0.0.0/0 10.0.0.0/8 \
+    && ! called "authorize.*0.0.0.0/0" && echo "$out" | grep -q "plus up to 2 of your other recent IPs"; } \
+  && pass "rdp (windows): adds you, keeps your 3 newest IPs on both ports, prunes the rest (incl. 0.0.0.0/0)" \
+  || fail "rdp keep newest" "$out $(cat "$AELLA_TEST_LOG")"
+
+sandbox; echo i-win > "$HOME/.aella-instance"; echo Administrator > "$HOME/.aella-user"
+export FAKE_PW="$PW" FAKE_SG_CIDRS="$SG_ROWS"
+out=$(aella rdp --only-here 2>&1)
+{ kept 203.0.113.7/32 && revoked 198.51.100.1/32 198.51.100.2/32 198.51.100.3/32 192.0.2.4/32 0.0.0.0/0 10.0.0.0/8 \
+    && echo "$out" | grep -q "allowed from 203.0.113.7 only"; } \
+  && pass "rdp --only-here (windows): revokes every IP but this one" || fail "rdp --only-here" "$out $(cat "$AELLA_TEST_LOG")"
+
+sandbox; echo i-win > "$HOME/.aella-instance"; echo Administrator > "$HOME/.aella-user"
+export FAKE_PW="$PW" FAKE_SG_CIDRS="$SG_ROWS" AELLA_WIN_IPS=4
+aella rdp >/dev/null 2>&1
+{ kept 203.0.113.7/32 198.51.100.1/32 198.51.100.2/32 198.51.100.3/32 && revoked 192.0.2.4/32 0.0.0.0/0; } \
+  && pass "AELLA_WIN_IPS=4: keeps one more" || fail "AELLA_WIN_IPS" "$(cat "$AELLA_TEST_LOG")"
+
+sandbox; echo i-win > "$HOME/.aella-instance"; echo Administrator > "$HOME/.aella-user"
+for bad in 0 00 -1 two; do
+  : > "$AELLA_TEST_LOG"; export FAKE_PW="$PW" AELLA_WIN_IPS="$bad"
+  out=$(aella rdp 2>&1); rc=$?
+  { [ $rc -eq 1 ] && ! called authorize-security-group-ingress && ! called revoke-security-group-ingress && ! called "^open "; } \
+    || { fail "AELLA_WIN_IPS=$bad" "rc=$rc $out"; bad=x; break; }
+done
+[ "$bad" = x ] || pass "AELLA_WIN_IPS=0/00/-1/two: refused, no rule touched"
+sandbox; echo i-win > "$HOME/.aella-instance"; echo Administrator > "$HOME/.aella-user"
+export FAKE_PW="$PW" FAKE_SG_CIDRS="$SG_ROWS" AELLA_WIN_IPS=08
+aella rdp >/dev/null 2>&1; rc=$?
+{ [ $rc -eq 0 ] && kept 198.51.100.3/32; } && pass "AELLA_WIN_IPS=08: decimal, not an octal error" || fail "AELLA_WIN_IPS=08" "rc=$rc"
+unset AELLA_WIN_IPS
+
+sandbox; echo i-win > "$HOME/.aella-instance"; echo Administrator > "$HOME/.aella-user"
+export FAKE_PW="$PW" FAKE_SG_DUP=1
+aella rdp >/dev/null 2>&1
+{ called "update-security-group-rule-descriptions-ingress .*203.0.113.7/32.*aella 20"; } \
+  && pass "rdp (windows) from an IP already allowed: re-stamps its rule, so it counts as recent" \
+  || fail "restamp" "$(cat "$AELLA_TEST_LOG")"
+unset FAKE_SG_DUP
+
+sandbox; echo i-win > "$HOME/.aella-instance"; echo Administrator > "$HOME/.aella-user"
+export FAKE_PW="$PW" FAKE_SG_CIDRS="$SG_ROWS" FAKE_MYIP=""
+out=$(aella rdp 2>&1); rc=$?
+{ [ $rc -eq 1 ] && ! called authorize-security-group-ingress && ! called revoke-security-group-ingress; } \
+  && pass "rdp (windows), public-IP lookup fails: no rule added, none revoked" || fail "rdp my_ip guard" "rc=$rc $out"
+unset FAKE_MYIP FAKE_SG_CIDRS
 
 sandbox; echo i-win > "$HOME/.aella-instance"; echo Administrator > "$HOME/.aella-user"
 export FAKE_IP=9.9.9.9 FAKE_PW="$PW" FAKE_OPEN_FAIL=1
@@ -406,10 +471,14 @@ out=$(aella rdp 2>&1); rc=$?
 sandbox; echo i-lin > "$HOME/.aella-instance"
 export FAKE_IP=9.9.9.9
 out=$(aella rdp 2>&1)
-{ called "authorize-security-group-ingress --group-id sg-123 .*3389" && ! called "^open " \
+{ called "authorize-security-group-ingress --group-id sg-123 --protocol tcp --port 3389 --cidr 203.0.113.7/32" && ! called "^open " \
     && ! called "get-password-data" && echo "$out" | grep -q "connect an RDP client to 9.9.9.9:3389"; } \
   && pass "rdp (linux box): unchanged — re-allows 3389 on aella-sg, no password, no .rdp" \
   || fail "rdp linux regressed" "$out $(cat "$AELLA_TEST_LOG")"
+sandbox; echo i-lin > "$HOME/.aella-instance"; export FAKE_SG_CIDRS="$SG_ROWS"
+out=$(aella rdp --only-here 2>&1)
+{ ! called revoke-security-group-ingress && ! called aella-win-sg && echo "$out" | grep -q "only-here is for Windows"; } \
+  && pass "rdp --only-here (linux box): aella-sg left alone" || fail "linux --only-here" "$out $(cat "$AELLA_TEST_LOG")"
 unset FAKE_IP FAKE_PW FAKE_SG_CIDRS FAKE_OPEN_FAIL
 
 # --- windows: ssh / push follow Administrator + PowerShell -----------------
