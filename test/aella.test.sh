@@ -16,10 +16,12 @@ sandbox() {
   export HOME="$SB" TMPDIR="$SB" AELLA_TEST_LOG="$SB/calls.log" AELLA_PW_POLL=0
   : > "$AELLA_TEST_LOG"
   unset FAKE_STATE FAKE_IP FAKE_LS_ROWS FAKE_IID FAKE_AMI FAKE_MYIP FAKE_PW FAKE_SSM FAKE_SG_CIDRS \
-        FAKE_PBCOPY_FAIL FAKE_OPEN_FAIL FAKE_PW_ERR FAKE_KEYGEN_FAIL FAKE_NO_KEYPAIR AELLA_PW_TIMEOUT AELLA_DISK AELLA_TYPE
+        FAKE_PBCOPY_FAIL FAKE_OPEN_FAIL FAKE_PW_ERR FAKE_KEYGEN_FAIL FAKE_NO_KEYPAIR FAKE_WAIT_SECS \
+        AELLA_PW_TIMEOUT AELLA_DISK AELLA_TYPE
 }
 aella() { env PATH="$DIR/bin:$PATH" bash "$AELLA" "$@"; }
 called() { grep -q "$1" "$AELLA_TEST_LOG"; }
+ncalls() { grep -c "$1" "$AELLA_TEST_LOG"; }
 
 echo "TEST: aella (mocked AWS — no real calls)"
 echo
@@ -65,6 +67,67 @@ out=$(aella up 2>&1); rc=$?
 { [ $rc -eq 1 ] && ! called "run-instances"; } \
   && pass "up with a live box: refuses, launches nothing (no orphan)" || fail "double-up guard" "rc=$rc"
 unset FAKE_STATE
+
+# --- one up/down at a time: a second one fails fast, launches nothing -------
+sandbox; export FAKE_WAIT_SECS=3
+aella up >/dev/null 2>&1 & bg=$!
+for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$HOME/.aella-lock/pid" ] && break; sleep 0.2; done
+out=$(aella up 2>&1); rc=$?
+out2=$(aella down -y 2>&1); rc2=$?
+wait "$bg"; rc1=$?
+{ [ $rc1 -eq 0 ] && [ $rc -eq 1 ] && echo "$out" | grep -q "already running (pid " \
+    && [ $rc2 -eq 1 ] && echo "$out2" | grep -q "already running" \
+    && [ "$(ncalls run-instances)" -eq 1 ] && ! called terminate-instances; } \
+  && pass "concurrent up/down: the second fails fast with a clear message, one launch, no terminate" \
+  || fail "concurrent lock" "rc1=$rc1 rc=$rc rc2=$rc2 $out $out2 $(cat "$AELLA_TEST_LOG")"
+[ ! -e "$HOME/.aella-lock" ] && [ "$(cat "$HOME/.aella-instance")" = i-newbox000 ] \
+  && pass "lock: released when up finishes; the first up's box is the tracked one" || fail "lock not released"
+unset FAKE_WAIT_SECS
+
+# the test script itself stands in for a live aella holding the lock
+sandbox; mkdir "$HOME/.aella-lock"; echo $$ > "$HOME/.aella-lock/pid"
+out=$(aella up 2>&1); rc=$?
+{ [ $rc -eq 1 ] && ! called run-instances && echo "$out" | grep -q "pid $$" \
+    && [ "$(cat "$HOME/.aella-lock/pid")" = $$ ]; } \
+  && pass "lock held by a live aella: refuses, launches nothing, leaves its lock alone" || fail "live lock" "rc=$rc $out"
+
+sandbox; sh -c 'exit 0' & dead=$!; wait "$dead"
+mkdir "$HOME/.aella-lock"; echo "$dead" > "$HOME/.aella-lock/pid"
+out=$(aella up 2>&1); rc=$?
+{ [ $rc -eq 0 ] && called run-instances && echo "$out" | grep -q "stale lock" && [ ! -e "$HOME/.aella-lock" ]; } \
+  && pass "stale lock (holder died): cleared, up proceeds, lock released" || fail "stale lock" "rc=$rc $out"
+
+sandbox; sleep 30 & other=$!
+mkdir "$HOME/.aella-lock"; echo "$other" > "$HOME/.aella-lock/pid"
+out=$(aella up 2>&1); rc=$?; kill "$other" 2>/dev/null; wait "$other" 2>/dev/null
+{ [ $rc -eq 0 ] && called run-instances; } \
+  && pass "stale lock whose pid was reused by a non-aella process: still cleared" || fail "pid reuse" "rc=$rc $out"
+
+sandbox; mkdir "$HOME/.aella-lock"   # no pid yet: its owner may be mid-mkdir
+out=$(aella up 2>&1); rc=$?
+{ [ $rc -eq 1 ] && ! called run-instances; } && pass "fresh lock with no pid yet: treated as busy" || fail "pid-less fresh lock" "rc=$rc $out"
+touch -t 202001010000 "$HOME/.aella-lock"
+out=$(aella up 2>&1); rc=$?
+{ [ $rc -eq 0 ] && called run-instances; } && pass "old lock with no pid: treated as stale" || fail "pid-less old lock" "rc=$rc $out"
+
+sandbox; echo i-running > "$HOME/.aella-instance"; export FAKE_STATE=running
+aella up >/dev/null 2>&1
+printf 'n\n' | aella down >/dev/null 2>&1
+[ ! -e "$HOME/.aella-lock" ] && pass "lock: released on the refusal paths too (orphan guard, 'kept')" || fail "lock leaked on refusal"
+unset FAKE_STATE
+
+sandbox; export FAKE_WAIT_SECS=2
+aella up >/dev/null 2>&1 & bg=$!
+for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$HOME/.aella-lock/pid" ] && break; sleep 0.2; done
+kill -TERM "$(cat "$HOME/.aella-lock/pid")"; wait "$bg"; rc=$?
+{ [ $rc -ne 0 ] && [ ! -e "$HOME/.aella-lock" ]; } && pass "lock: released when up is killed mid-launch" || fail "lock leaked on TERM" "rc=$rc"
+unset FAKE_WAIT_SECS
+
+sandbox; echo i-abc > "$HOME/.aella-instance"; export FAKE_IP=9.9.9.9
+mkdir "$HOME/.aella-lock"; echo $$ > "$HOME/.aella-lock/pid"
+aella ssh >/dev/null 2>&1; rc=$?
+{ [ $rc -eq 0 ] && called "ssh .*ubuntu@9.9.9.9"; } && pass "lock: only up/down take it — ssh works during an up" || fail "ssh blocked by lock"
+unset FAKE_IP
 
 # --- cur_ip guard: no ssh to an empty host --------------------------------
 sandbox; echo i-abc > "$HOME/.aella-instance"; export FAKE_IP=None

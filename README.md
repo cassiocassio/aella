@@ -54,7 +54,7 @@ which is rare for its genre:
 ```sh
 aella down                                       # if a box is still running
 rm -rf ~/.aella ~/.local/bin/aella               # the tool (adjust to where you put it)
-rm -f  ~/.aella-instance ~/.aella-user ~/.ssh/aella-key.pem   # its only local state + the key
+rm -rf ~/.aella-instance ~/.aella-user ~/.aella-lock ~/.ssh/aella-key.pem   # its only local state + the key
 ```
 
 And on the AWS side, if you want it fully gone:
@@ -207,6 +207,12 @@ in a new region, aella imports your existing key pair there.
 - State lives in `~/.aella-instance` (the current instance id) and `~/.aella-user` (its login
   name, since Ubuntu, Fedora and Windows images differ; `Administrator` marks a Windows box). Nothing else is stored. A box launched before
   `~/.aella-user` existed is assumed to be Ubuntu.
+- **One `up`/`down` at a time.** Two sessions launching at once could each start a box and
+  only one would be tracked, the other billing unseen. So `up` and `down` hold a lock
+  (`~/.aella-lock`, a directory holding the owner's pid) and a second one fails straight
+  away with the owner's pid. A lock left by a crashed or killed run is noticed (its pid is
+  gone, or isn't aella any more) and cleared. If it ever blocks you wrongly,
+  `rm -rf ~/.aella-lock`. `ssh`, `push`, `ls` and the rest don't take it.
 - **`push`/`pull` remote paths are relative to the box's home** (`/home/ubuntu`,
   `/home/fedora`, or `C:\Users\Administrator`), so `aella push clip.mov work/` lands in `~/work/`. An absolute path like
   `/data` only works if the login user can write there — for a disposable box, stick to
@@ -219,7 +225,8 @@ in a new region, aella imports your existing key pair there.
 
 `bash test/aella.test.sh` — unit tests that mock the AWS CLI (`test/bin/aws`), so they
 never touch AWS or spend a cent. They pin the parts where a regression would cost money or
-lock you out: the orphan-billing guard, the `down` confirmation, the no-empty-host ssh guard,
+lock you out: the orphan-billing guard, the one-`up`/`down`-at-a-time lock (including a
+real concurrent pair, and stale-lock recovery), the `down` confirmation, the no-empty-host ssh guard,
 the user-data heredocs, and — for Fedora — that the release picker skips the Rawhide/ELN
 decoys and that every `ssh`/`push`/`pull` follows the box's real login name — and for
 Windows that RDP/SSH ingress is your `/32` only and never touches `aella-sg`, that the

@@ -24,6 +24,12 @@ STATE="$HOME/.aella-instance"
 # have no record and are Ubuntu by definition — hence the fallback.
 USERSTATE="$HOME/.aella-user"
 
+# up and down hold this while they read and rewrite the state above: two at once could
+# launch two boxes and track only one, which then bills unseen. A directory, because
+# mkdir is atomic everywhere and macOS has no flock.
+LOCK="$HOME/.aella-lock"
+HAVE_LOCK=
+
 box_user() { cat "$USERSTATE" 2>/dev/null || echo ubuntu; }
 is_windows() { [ "$(box_user)" = Administrator ]; }
 
@@ -51,6 +57,8 @@ usage: aella <command> [arg]
   status         show the current box
   down [-y]      terminate it — irreversible, deletes the box and its disk (-y skips the prompt)
 
+  up and down run one at a time per machine: a second one exits at once (~/.aella-lock).
+
 env overrides:
   AELLA_REGION   AWS region        (default $REGION)
   AELLA_TYPE     instance type     (default $TYPE)
@@ -77,6 +85,56 @@ preflight() {  # fail early and helpfully if the AWS CLI isn't usable
   log "  brew install awscli && aws configure     (region: $REGION)"
   exit 1
 }
+
+lock_busy() {  # $1 = holder's pid, if known
+  log "another aella up/down is already running${1:+ (pid $1)} — let it finish, then retry."
+  log "  (if nothing is running, e.g. after a crash: rm -rf $LOCK)"
+  exit 1
+}
+
+lock_holder_alive() {  # $1 = pid. Alive AND still aella: a pid from before a reboot can be reused
+  kill -0 "$1" 2>/dev/null || return 1
+  case "$(ps -p "$1" -o command= 2>/dev/null || echo aella)" in *aella*) return 0 ;; esac
+  return 1
+}
+
+break_stale_lock() {  # $1 = the dead holder's pid (or ""). Rename first, so only one racer wins.
+  local tmp="$LOCK.stale.$$"
+  mv "$LOCK" "$tmp" 2>/dev/null || return 0   # someone else cleared it: just try mkdir again
+  if [ "$(cat "$tmp/pid" 2>/dev/null || true)" != "$1" ]; then
+    # what we moved was a fresh lock taken since we looked: put it back and back off
+    [ -e "$LOCK" ] || mv "$tmp" "$LOCK" 2>/dev/null || true
+    return 1
+  fi
+  rm -rf "$tmp"
+  log "(cleared a stale lock${1:+ left by pid $1})"
+}
+
+take_lock() {  # fails fast if another up/down holds it; released on any exit
+  local pid try
+  for try in 1 2; do
+    if mkdir "$LOCK" 2>/dev/null; then
+      HAVE_LOCK=1; echo $$ > "$LOCK/pid"
+      trap 'exit 130' INT; trap 'exit 143' TERM HUP   # so Ctrl-C still runs the EXIT cleanup
+      return 0
+    fi
+    pid=$(cat "$LOCK/pid" 2>/dev/null || true)
+    case "$pid" in
+      ""|*[!0-9]*)  # no pid: its owner is between mkdir and writing it — or died right there
+        pid=""; [ -n "$(find "$LOCK" -maxdepth 0 -mmin +1 2>/dev/null)" ] || lock_busy ;;
+      *) ! lock_holder_alive "$pid" || lock_busy "$pid" ;;
+    esac
+    break_stale_lock "$pid" || lock_busy
+  done
+  lock_busy
+}
+
+release_lock() {  # only ever our own
+  if [ -n "$HAVE_LOCK" ] && [ "$(cat "$LOCK/pid" 2>/dev/null || true)" = "$$" ]; then rm -rf "$LOCK"; fi
+  HAVE_LOCK=
+}
+
+cleanup() { if [ -n "${UDFILE:-}" ]; then rm -f "$UDFILE"; fi; release_lock; }
 
 ensure_key() {
   if [ -s "$PEM" ]; then
@@ -367,6 +425,7 @@ chown "$AELLA_USER:$AELLA_USER" "$BASHRC"
 UD
 }
 
+trap cleanup EXIT
 case "${1:-}" in
   help|-h|--help) print_help ;;
   up)
@@ -385,6 +444,7 @@ case "${1:-}" in
       case "$DISK" in ""|*[!0-9]*) DISK=0 ;; esac
       [ "$DISK" -ge 30 ] || { log "Windows needs AELLA_DISK >= 30 (its image is 30 GB)"; exit 1; }
     fi
+    take_lock
     # refuse to orphan a box that's already up (it would keep billing untracked)
     if [ -s "$STATE" ]; then
       st=$(aws ec2 describe-instances --instance-ids "$(cat "$STATE")" \
@@ -416,7 +476,7 @@ case "${1:-}" in
     esac
     case "$AMI" in ami-*) ;; *) log "no $PRETTY $ver AMI available in $REGION"; exit 1 ;; esac
     log "launching $TYPE from $AMI ($PRETTY $ver) ..."
-    UDFILE=$(mktemp); trap 'rm -f "$UDFILE"' EXIT
+    UDFILE=$(mktemp)   # removed by cleanup on exit
     if [ "$DISTRO" = windows ]; then
       # user-data only enables sshd; RDP works without it, so a key we can't read just means RDP-only
       build_userdata_windows "$(ssh-keygen -y -f "$PEM" 2>/dev/null || true)" > "$UDFILE" \
@@ -496,6 +556,7 @@ case "${1:-}" in
     aws ec2 describe-instances --instance-ids "$IID" \
       --query 'Reservations[0].Instances[0].[InstanceId,State.Name,PublicIpAddress,InstanceType]' --output text ;;
   down)
+    take_lock
     IID=$(cat "$STATE" 2>/dev/null || true); [ -z "$IID" ] && { echo "no box"; exit 0; }
     if [ "${2:-}" != "-y" ] && [ "${2:-}" != "--yes" ]; then
       printf 'terminate %s? this deletes the box and its disk. [y/N] ' "$IID"
