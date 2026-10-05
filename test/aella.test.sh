@@ -183,9 +183,9 @@ sandbox; export FAKE_PW="$PW"
 out=$(aella up --windows 2>&1); rc=$?
 { [ $rc -eq 0 ] && called "ssm get-parameter --name /aws/service/ami-windows-latest/Windows_Server-2025-English-Full-Base" \
     && called "run-instances --image-id ami-win2025 --instance-type m7i-flex.large" \
-    && called 'VolumeSize":30' && called "Key=aella-os,Value=windows" \
+    && called 'VolumeSize":60' && called "Key=aella-os,Value=windows" \
     && [ "$(cat "$HOME/.aella-user" 2>/dev/null)" = Administrator ]; } \
-  && pass "up --windows: SSM AMI, m7i-flex.large, 30 GB, tagged, records Administrator" \
+  && pass "up --windows: SSM AMI, m7i-flex.large, 60 GB, tagged, records Administrator" \
   || fail "up --windows" "rc=$rc $out $(cat "$AELLA_TEST_LOG")"
 { called "authorize-security-group-ingress .*--port 3389 --cidr 203.0.113.7/32" \
     && called "authorize-security-group-ingress .*--port 22 --cidr 203.0.113.7/32" \
@@ -208,6 +208,10 @@ sandbox; export AELLA_DISK=20
 out=$(aella up --windows 2>&1); rc=$?
 { [ $rc -eq 1 ] && ! called "run-instances" && echo "$out" | grep -q ">= 30"; } \
   && pass "up --windows with AELLA_DISK=20: refuses before launching" || fail "windows disk floor" "rc=$rc $out"
+sandbox; export FAKE_PW="$PW" AELLA_DISK=30
+aella up --windows >/dev/null 2>&1; rc=$?
+{ [ $rc -eq 0 ] && called 'VolumeSize":30'; } \
+  && pass "up --windows with AELLA_DISK=30: the floor itself is allowed" || fail "windows disk at floor" "rc=$rc"
 
 # --- windows: failure paths ------------------------------------------------
 sandbox; export FAKE_PW="$PW" FAKE_SSM=denied

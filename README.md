@@ -147,7 +147,9 @@ aella down               # stop the meter (the licence is billed with the instan
   `aws ec2 get-console-output --instance-id <id> --latest`. So `ssh`,
   `tunnel`, `push` and `pull` work too; remote paths are relative to
   `C:\Users\Administrator`. sshd was up within seconds of the password in testing.
-- **Disk:** 30 GB, the image's own minimum (`AELLA_DISK` can raise it, not lower it).
+- **Disk:** 60 GB by default. 30 GB is the image's own size and the floor (`AELLA_DISK`
+  can't go below it), but it's tight: after Python, a pipx-installed app (~560 MB venv)
+  and a 1.5 GB Whisper model, only ~2 GB was left.
 - **Cost.** The Windows licence is billed per second on top of the instance, and only while
   the box exists. On-demand, Oct 2026, licence included:
 
@@ -158,14 +160,15 @@ aella down               # stop the meter (the licence is billed with the instan
   | eu-west-1 (Ireland) | $0.194/hr | $0.119/hr |
   | us-east-1 (N. Virginia) | $0.183/hr | $0.111/hr |
 
-  Add ~$0.005/hr for the public IPv4 address, plus the 30 GB gp3 disk (~$2.50/month pro
-  rata, i.e. under half a cent an hour). That comes to roughly $0.20/hr for the default.
+  Add ~$0.005/hr for the public IPv4 address, plus the 60 GB gp3 disk at ~$0.084/GB-month
+  in eu-north-1: ~$5/month pro rata, under a cent an hour, billed only while the box
+  exists. That comes to roughly $0.20/hr for the default.
   `AELLA_TYPE=t3.large` is about 40% cheaper because AWS licenses Windows on t3 more
   cheaply. But [free-plan AWS accounts](https://aws.amazon.com/free/) refuse it ("not
   eligible for Free Tier"), which is why it isn't the default. Being burstable, it also
   charges extra CPU credits if the box runs flat out for long.
 - **Why not keep a Windows box around?** Stopped, it would cost only its disk, about
-  $2.50–2.80 a month. But aella is built around terminate-and-relaunch, and a fresh box is
+  $5–5.60 a month at 60 GB. But aella is built around terminate-and-relaunch, and a fresh box is
   ~2 minutes and about a cent of waiting. Even launched daily, disposable is cheaper, and each
   box starts clean from Amazon's latest monthly-patched image. What you trade is setup:
   anything you install is gone on `down`.
@@ -180,7 +183,7 @@ Override the defaults with env vars — handy for renting bigger or odd silicon:
 | `AELLA_TYPE` | `m7i-flex.large` | instance type (amd64, 8 GB — **not** free tier) |
 | `AELLA_DISTRO` | `ubuntu` | `ubuntu`, `fedora` or `windows` (per-run: `up --fedora` / `up --windows`) |
 | `AELLA_FEDORA` | `42` | Fedora release to launch |
-| `AELLA_DISK` | `20` | root disk, GB (Windows: `30`, its minimum) |
+| `AELLA_DISK` | `20` | root disk, GB (Windows: `60`; `30` minimum) |
 | `AELLA_LTS` | `24.04` | which LTS `up` uses by default |
 | `AELLA_PW_TIMEOUT` | `900` | seconds to wait for a Windows box's password |
 

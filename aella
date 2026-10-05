@@ -7,7 +7,7 @@ export AWS_PAGER=""
 REGION="${AELLA_REGION:-eu-north-1}"
 TYPE="${AELLA_TYPE:-m7i-flex.large}"    # amd64, 8 GB — NOT free tier, bills per-second
 DISK="${AELLA_DISK:-20}"
-WIN_DISK="${AELLA_DISK:-30}"            # the Windows AMI's own snapshot is 30 GB; it can't go smaller
+WIN_DISK="${AELLA_DISK:-60}"            # 30 GB (the AMI's own size, and the floor) filled up with Python + a Whisper model
 LTS="${AELLA_LTS:-24.04}"                # default Ubuntu; `up --latest` picks the newest release
 DISTRO="${AELLA_DISTRO:-ubuntu}"         # ubuntu | fedora | windows; `up --fedora` / `--windows` override per-run
 FEDORA="${AELLA_FEDORA:-42}"             # default Fedora release; `up --fedora --latest` picks the newest
@@ -54,7 +54,7 @@ usage: aella <command> [arg]
 env overrides:
   AELLA_REGION   AWS region        (default $REGION)
   AELLA_TYPE     instance type     (default $TYPE)
-  AELLA_DISK     root disk in GB   (default $DISK; Windows $WIN_DISK, its minimum)
+  AELLA_DISK     root disk in GB   (default $DISK; Windows $WIN_DISK, minimum 30)
   AELLA_LTS      Ubuntu LTS        (default $LTS)
   AELLA_DISTRO   ubuntu | fedora | windows   (default $DISTRO)
   AELLA_FEDORA   Fedora release    (default $FEDORA)
@@ -64,7 +64,8 @@ cost: every box bills per second while it exists (down stops it). Windows adds a
   licence to the hourly rate: m7i-flex.large is ~\$0.18-0.20/hr all-in (eu-north-1
   \$0.189, us-east-1 \$0.183, eu-west-2 \$0.198; Oct 2026 on-demand). AELLA_TYPE=t3.large
   is ~\$0.11-0.12/hr, but free-plan AWS accounts can't launch it. Plus ~\$0.005/hr for
-  the public IP, and its 30 GB disk (~\$2.50/month, pro rata, until down).
+  the public IP, and its $WIN_DISK GB gp3 disk at ~\$0.084/GB-month in eu-north-1 (60 GB:
+  ~\$5/month, under a cent an hour), billed pro rata only while the box exists.
 
 setup (once):  brew install awscli && aws configure   (region: $REGION)
 EOF
