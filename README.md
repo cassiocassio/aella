@@ -19,8 +19,7 @@ aella down               # terminate it — disk and all
 
 ## Install
 
-Needs the AWS CLI, configured — plus `ssh`, `scp`, and `curl`, all standard on macOS and
-every major Linux distro. Pure bash (3.2+), no other dependencies.
+Needs the AWS CLI, configured — plus `ssh`, `scp`, and `curl`. Pure bash (3.2+), no other dependencies.
 
 ```sh
 brew install awscli        # or your platform's package manager (apt, dnf, pacman, …)
