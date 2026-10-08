@@ -5,7 +5,7 @@ No EC2 console, ever.
 
 `aella` is a thin wrapper around the AWS CLI. It remembers your key pair, security group,
 instance type, and the current box, so spinning one up (or killing it) is one word. Named
-for the Amazon **Aella** — "whirlwind" — which is about the right lifespan for these boxes.
+for the Amazon **Aella** — "whirlwind".
 
 ```
 aella up                 # launch a fresh box (current LTS), print its IP + ssh line
